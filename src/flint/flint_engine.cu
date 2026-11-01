@@ -759,11 +759,30 @@ bool load(const std::string& path, Model& m, std::string& err) {
         }
         m.embd_row = row_bytes(m.embd_type, (int64_t) t->shape[0]);
         const uint64_t nb = strata::tensor_payload_bytes(*t);
+        // one row of the table is read per token: it stays in page-locked host memory (the kernel reads the row over the bus),
+        // and the VRAM it would take goes to the expert cache (0.3 GiB is about 3 tokens/s of decode).  STRATA_FLINT_EMBD_VRAM=1
+        // puts it in the VRAM.
         uint8_t* d = nullptr;
-        CK(cudaMalloc(&d, nb));
-        CK(cudaMemcpy(d, gm.shard(s).tensor_data(*t), nb, cudaMemcpyHostToDevice));
-        m.embd = d;
-        bytes += nb;
+        void* hp = nullptr;
+        if (!std::getenv("STRATA_FLINT_EMBD_VRAM") && cudaHostAlloc(&hp, nb, cudaHostAllocMapped) == cudaSuccess) {
+            std::memcpy(hp, gm.shard(s).tensor_data(*t), nb);
+            void* dp = nullptr;
+            if (cudaHostGetDevicePointer(&dp, hp, 0) == cudaSuccess && dp) {
+                m.embd = (const uint8_t*) dp;
+            } else {
+                (void) cudaGetLastError();
+                cudaFreeHost(hp);
+                hp = nullptr;
+            }
+        } else {
+            (void) cudaGetLastError();
+        }
+        if (!hp) {
+            CK(cudaMalloc(&d, nb));
+            CK(cudaMemcpy(d, gm.shard(s).tensor_data(*t), nb, cudaMemcpyHostToDevice));
+            m.embd = d;
+            bytes += nb;
+        }
     }
     std::fprintf(stderr, "strata-flint: %s: %.2f GiB on the GPU in %.1f s (the routed experts are placed after the "
                  "engine's buffers)\n", path.c_str(), (double) bytes / (1 << 30), ms_since(t0) / 1000.0);
