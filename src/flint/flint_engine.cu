@@ -26,6 +26,7 @@
 #include "strata/flint/engine.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/qwen35/sampling.hpp"
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -35,12 +36,17 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
+#include <deque>
+#include <random>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <condition_variable>
+#include <csignal>
+#include <iostream>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -364,6 +370,7 @@ struct Layer {
 struct Model {
     std::shared_ptr<strata::GgufModel> file;
     std::string file_path;                     // the one file the expert reads go to
+    std::vector<int32_t> eog;                  // tokenizer.ggml.eog_token_ids: the ids that end a turn
     int64_t N = 0, FF = 0, H = 0, HKV = 0, L = 0, NE = 0, TK = 0, FFE = 0, FFS = 0, VOC = 0, n_dense = 0, window = 0;
     float eps = 1e-6f, rope_base = 10000.f, w_scale = 1.f;
     std::vector<Layer> layers;
@@ -480,6 +487,10 @@ bool load(const std::string& path, Model& m, std::string& err) {
         err = "a geometry this driver's kernels do not take";
         return false;
     }
+    if (const strata::MetaValue* v = gm.meta().get("tokenizer.ggml.eog_token_ids"))
+        for (const strata::MetaValue& e : v->items) m.eog.push_back((int32_t) e.u);
+    if (m.eog.empty())
+        if (const strata::MetaValue* v = gm.meta().get("tokenizer.ggml.eos_token_id")) m.eog.push_back((int32_t) v->u);
     const strata::MetaValue* swa = gm.meta().get(p + "attention.sliding_window_pattern");
     const strata::MetaValue* rop = gm.meta().get(p + "attention.rope_pattern");
     if (const strata::MetaValue* v = gm.meta().get("tokenizer.ggml.tokens")) m.VOC = (int64_t) v->count;
@@ -1378,6 +1389,204 @@ std::vector<int32_t> parse_ids(const char* s) {
     return v;
 }
 
+// ------------------------------------------------------------------------------------------------ the engine protocol
+/// The host sampler (the one of the Qwen3.6 path): penalties, then greedy, or top-k / top-p / min-p at the temperature.
+int sample(std::vector<float>& lg, const strata::qwen35::Sampling& s, const std::vector<int32_t>& hist, std::mt19937_64& rng) {
+    strata::qwen35::apply_penalties(lg, s, hist);
+    if (s.temperature <= 0.f) return (int) (std::max_element(lg.begin(), lg.end()) - lg.begin());
+    const int kk = std::max(1, std::min(s.top_k > 0 ? s.top_k : 64, (int) lg.size()));
+    std::vector<int> idx(lg.size());
+    for (size_t i = 0; i < idx.size(); ++i) idx[i] = (int) i;
+    std::partial_sort(idx.begin(), idx.begin() + kk, idx.end(), [&](int a, int b) { return lg[(size_t) a] > lg[(size_t) b]; });
+    idx.resize((size_t) kk);
+    std::vector<double> pr(idx.size());
+    const double mx = lg[(size_t) idx[0]];
+    double sum = 0;
+    for (size_t i = 0; i < idx.size(); ++i) sum += (pr[i] = std::exp((lg[(size_t) idx[i]] - mx) / s.temperature));
+    size_t keep = idx.size();
+    double cum = 0;
+    for (size_t i = 0; i < idx.size(); ++i) {
+        if (pr[i] / sum < s.min_p * (pr[0] / sum)) { keep = i; break; }
+        cum += pr[i] / sum;
+        if (cum >= s.top_p) { keep = i + 1; break; }
+    }
+    keep = std::max<size_t>(1, keep);
+    double tot = 0;
+    for (size_t i = 0; i < keep; ++i) tot += pr[i];
+    std::uniform_real_distribution<double> u(0.0, tot);
+    double r = u(rng);
+    for (size_t i = 0; i < keep; ++i)
+        if ((r -= pr[i]) <= 0) return idx[i];
+    return idx[keep - 1];
+}
+
+/// The protocol serve/server.py speaks to an engine (the same lines as the Qwen3.6 path, one request at a time):
+///   READY <context> stop                     once, when the model is placed
+///   GEN <max_new> [key=value ...] <id,id,...>   a request; keys: temperature top_p top_k min_p penalty_last_n penalty_repeat
+///                                            penalty_freq penalty_present seed (others are ignored)
+///   PP <done> <total> <ms> <tok/s>           while the prompt is read (a chunk each)
+///   T <id>                                   every generated token (the ending one too)
+///   DONE <n> <prompt> <prompt ms> <decode ms> <finish> <accepted> <offered> <reused> 0 0 0 0 0.0 <read> 0
+///   STOP                                     (any time) ends the request at the next token or chunk
+///   ERR <text>                               a request that cannot run
+/// The tokens the cache holds (`live`) are kept between requests: a prompt that starts with them reads only its new end.
+/// The sliding-window layers keep a ring of kRing cells, so a state can be continued only from at most 512 tokens before
+/// its end (the window it needs is still in the ring); a prompt that diverges earlier is read from the start.
+struct Server {
+    Engine& E;
+    const Model& M;
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<std::string> lines;
+    bool eof = false;
+    std::atomic<bool> stop{false};
+    std::vector<int32_t> live;   // positions 0 .. live.size() - 1 are in the KV caches
+
+    Server(Engine& e, const Model& m) : E(e), M(m) {}
+
+    bool is_eog(int32_t t) const { return std::find(M.eog.begin(), M.eog.end(), t) != M.eog.end(); }
+
+    void request(const std::string& line) {
+        if (line.rfind("GEN ", 0) != 0) {
+            std::printf("ERR expected: GEN <max_new> [key=value ...] <id,id,...>\n");
+            std::fflush(stdout);
+            return;
+        }
+        const char* p = line.c_str() + 4;
+        char* e1 = nullptr;
+        const long long max_new = std::strtoll(p, &e1, 10);
+        p = e1;
+        strata::qwen35::Sampling smp;
+        for (;;) {
+            while (*p == ' ') ++p;
+            const char* st0 = p;
+            while (*p && *p != ' ') ++p;
+            const std::string tk(st0, (size_t) (p - st0));
+            const size_t eq = tk.find('=');
+            if (tk.empty() || eq == std::string::npos) { p = st0; break; }
+            const std::string key = tk.substr(0, eq);
+            const char* v = tk.c_str() + eq + 1;
+            if (key == "temperature") smp.temperature = std::strtof(v, nullptr);
+            else if (key == "top_p") smp.top_p = std::strtof(v, nullptr);
+            else if (key == "top_k") smp.top_k = std::atoi(v);
+            else if (key == "min_p") smp.min_p = std::strtof(v, nullptr);
+            else if (key == "penalty_last_n") smp.last_n = std::atoi(v);
+            else if (key == "penalty_repeat") smp.repeat = std::strtof(v, nullptr);
+            else if (key == "penalty_freq") smp.freq = std::strtof(v, nullptr);
+            else if (key == "penalty_present") smp.present = std::strtof(v, nullptr);
+            else if (key == "seed") smp.seed = std::strtoull(v, nullptr, 10);
+        }
+        const std::vector<int32_t> ids = parse_ids(p);
+        if (max_new < 1 || ids.empty()) {
+            std::printf("ERR bad request: max_new or the ids\n");
+            std::fflush(stdout);
+            return;
+        }
+        if ((long long) ids.size() + max_new > E.ctx) {
+            std::printf("ERR prompt (%zu tokens) + max_new (%lld) exceeds the context (%d)\n", ids.size(), max_new, E.ctx);
+            std::fflush(stdout);
+            return;
+        }
+        for (int32_t t : ids)
+            if (t < 0 || t >= (int32_t) M.VOC) {
+                std::printf("ERR a token id is outside the vocabulary\n");
+                std::fflush(stdout);
+                return;
+            }
+        stop.store(false);
+        // what the cache already holds of this prompt
+        size_t reuse = 0;
+        while (reuse < live.size() && reuse < ids.size() && live[reuse] == ids[reuse]) ++reuse;
+        if (reuse == ids.size()) reuse = ids.size() - 1;                 // the last token is read again: its logits start the answer
+        if (reuse > 0 && reuse + (size_t) (kRing / 2) < live.size()) reuse = 0;   // the window before `reuse` is gone from the ring
+        live.resize(reuse);
+        const auto t0 = Clock::now();
+        const long long fresh = (long long) (ids.size() - reuse);
+        bool cancelled = false;
+        size_t done = reuse;
+        while (done < ids.size()) {
+            const int T = (int) std::min<size_t>((size_t) E.tmax, ids.size() - done);
+            const bool last = done + (size_t) T == ids.size();
+            E.forward(ids.data() + done, T, (int) done, last);
+            CK(cudaStreamSynchronize(E.st));
+            live.insert(live.end(), ids.begin() + (long) done, ids.begin() + (long) done + T);
+            done += (size_t) T;
+            std::printf("PP %lld %lld %.0f %.1f\n", (long long) (done - reuse), fresh, ms_since(t0),
+                        (double) (done - reuse) / std::max(1e-9, ms_since(t0) / 1000.0));
+            std::fflush(stdout);
+            if (stop.load() && done < ids.size()) { cancelled = true; break; }
+        }
+        const double prompt_ms = ms_since(t0);
+        if (cancelled) {
+            std::printf("DONE 0 %zu %.1f 0.0 cancel 0 0 %zu 0 0 0 0 0.0 %lld 0\n", ids.size(), prompt_ms, reuse,
+                        (long long) (done - reuse));
+            std::fflush(stdout);
+            return;
+        }
+        std::mt19937_64 rng(smp.seed);
+        std::vector<int32_t> hist = ids;
+        std::vector<float> lg;
+        const auto d0 = Clock::now();
+        long long produced = 0;
+        const char* finish = "length";
+        int pos = (int) ids.size();
+        for (;;) {
+            E.host_logits(lg);
+            const int32_t nx = (int32_t) sample(lg, smp, hist, rng);
+            std::printf("T %d\n", nx);
+            std::fflush(stdout);
+            ++produced;
+            hist.push_back(nx);
+            if (is_eog(nx)) { finish = "stop"; break; }
+            if (produced >= max_new) break;
+            if (stop.load()) { finish = "cancel"; break; }
+            if (pos + 1 > E.ctx) break;
+            E.forward(&nx, 1, pos, true);
+            live.push_back(nx);
+            ++pos;
+        }
+        const double decode_ms = ms_since(d0);
+        std::printf("DONE %lld %zu %.1f %.1f %s 0 0 %zu 0 0 0 0 0.0 %lld 0\n", produced, ids.size(), prompt_ms, decode_ms, finish,
+                    reuse, fresh);
+        std::fflush(stdout);
+        std::fprintf(stderr, "strata serve: prompt %zu tokens = %zu reused + %lld read in %.0f ms (%.1f tok/s), %lld generated in "
+                     "%.0f ms (%.1f tok/s) (%s)\n", ids.size(), reuse, fresh, prompt_ms,
+                     prompt_ms > 0 ? 1000.0 * (double) fresh / prompt_ms : 0.0, produced, decode_ms,
+                     decode_ms > 0 ? 1000.0 * (double) produced / decode_ms : 0.0, finish);
+    }
+
+    int run() {
+        std::printf("READY %d stop\n", E.ctx);
+        std::fflush(stdout);
+        std::thread reader([&] {
+            std::string l;
+            while (std::getline(std::cin, l)) {
+                if (!l.empty() && l.back() == '\r') l.pop_back();
+                if (l == "STOP") { stop.store(true); continue; }
+                std::lock_guard<std::mutex> lk(mu);
+                lines.push_back(l);
+                cv.notify_one();
+            }
+            std::lock_guard<std::mutex> lk(mu);
+            eof = true;
+            cv.notify_one();
+        });
+        reader.detach();
+        for (;;) {
+            std::string line;
+            {
+                std::unique_lock<std::mutex> lk(mu);
+                cv.wait(lk, [&] { return eof || !lines.empty(); });
+                if (lines.empty()) return 0;
+                line = lines.front();
+                lines.pop_front();
+            }
+            if (line.empty()) continue;
+            request(line);
+        }
+    }
+};
+
 }  // namespace
 
 int strata::flint::run(int argc, char** argv) {
@@ -1391,6 +1600,7 @@ int strata::flint::run(int argc, char** argv) {
     bool pin_host = true, prof_predict = false;
     int prefetch_k = 0;   // the lookahead (--prefetch N): measured no faster than the page-locked host tier alone
     std::string nll_file;
+    bool serve_mode = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> const char* {
@@ -1401,6 +1611,10 @@ int strata::flint::run(int argc, char** argv) {
             return argv[++i];
         };
         if (a == "--model" || a == "--native") path = next();
+        else if (a == "--serve") serve_mode = true;
+        else if (a == "--ctx") ctx = std::atoi(next());
+        else if (a == "--prefill") { const std::string v = next(); chunk = v == "auto" ? 512 : std::atoi(v.c_str()); }
+        else if (a == "--gpu") (void) next();   // applied by strata before the switch (HIP_VISIBLE_DEVICES)
         else if (a == "--tokens") prompt = parse_ids(next());
         else if (a == "--n" || a == "--max-new") n_new = std::atoi(next());
         else if (a == "--dump-full-logits") dump = next();
@@ -1436,12 +1650,19 @@ int strata::flint::run(int argc, char** argv) {
                         "  --nll F               -log p(next prompt token) of every prompt position (f32), for a perplexity check\n"
                         "  --prof, --prof-predict, --trace   timing, lookahead-guess and per-layer diagnostics\n");
             return 0;
+        } else if (serve_mode && a.rfind("--", 0) == 0) {
+            // serve passes the config's args plus a few of its own: one this engine does not have is said and skipped
+            // (with its value), not fatal
+            const bool val = i + 1 < argc && std::string(argv[i + 1]).rfind("--", 0) != 0;
+            std::fprintf(stderr, "strata-flint: ignoring %s%s%s (not an option of this engine)\n", a.c_str(), val ? " " : "",
+                         val ? argv[i + 1] : "");
+            if (val) ++i;
         } else {
             std::fprintf(stderr, "strata-flint: unknown argument %s\n", a.c_str());
             return 2;
         }
     }
-    if (path.empty() || prompt.empty()) {
+    if (path.empty() || (prompt.empty() && !serve_mode)) {
         std::fprintf(stderr, "strata-flint: --model FILE and --tokens IDS are needed (see --help)\n");
         return 2;
     }
@@ -1456,7 +1677,8 @@ int strata::flint::run(int argc, char** argv) {
         std::fprintf(stderr, "strata-flint: %s\n", e.what());
         return 1;
     }
-    if ((int) prompt.size() + n_new + 8 > ctx) ctx = (int) prompt.size() + n_new + 8;
+    if (serve_mode && ctx == 4096) ctx = 32768;   // (the default of a server; --max-context says otherwise)
+    if (!serve_mode && (int) prompt.size() + n_new + 8 > ctx) ctx = (int) prompt.size() + n_new + 8;
     Engine E;
     E.trace = trace;
     E.buffered = buffered;
@@ -1497,6 +1719,11 @@ int strata::flint::run(int argc, char** argv) {
         const size_t reserve = (size_t) (0.6 * (1 << 30));
         const size_t budget = expert_vram >= 0 ? (size_t) (expert_vram * (double) (1 << 30)) : (fr > reserve ? fr - reserve : 0);
         E.place_experts(budget);
+    }
+    if (serve_mode) {
+        std::signal(SIGPIPE, SIG_IGN);
+        Server sv(E, m);
+        return sv.run();
     }
     // the prompt, in chunks
     const auto t0 = Clock::now();

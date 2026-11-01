@@ -914,6 +914,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(strata-flint src/flint/flint_main.cpp)
   strata_utf8_manifest(strata-flint)
   target_link_libraries(strata-flint PRIVATE strata_flint ${_strata_gpu_runtime_target})
+  # `strata` hands a flint file to it (the family switch at the top of its main), as it does a qwen35moe one
+  target_link_libraries(strata PRIVATE strata_flint)
+  target_compile_definitions(strata PRIVATE STRATA_HAVE_FLINT=1)
   endif()
 
   # DeepSeek-V4.1-Flash: the third engine path (src/dsv41, from Project Maya's maya-ds4, MIT, third_party/project-maya).

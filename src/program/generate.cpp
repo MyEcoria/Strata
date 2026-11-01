@@ -121,6 +121,9 @@
 #if defined(STRATA_HAVE_QWEN35)
 #include "strata/qwen35/engine.hpp"
 #endif
+#if defined(STRATA_HAVE_FLINT)
+#include "strata/flint/engine.hpp"
+#endif
 #if defined(_WIN32)
 #include <windows.h>
 #include <psapi.h>
@@ -2923,8 +2926,12 @@ int main(int argc, char** argv) {
         }
         // `strata --families`: the GGUF architectures this build runs (setup asks before it installs one)
         if (std::strcmp(argv[i], "--families") == 0) {
-#if defined(STRATA_HAVE_QWEN35)
+#if defined(STRATA_HAVE_QWEN35) && defined(STRATA_HAVE_FLINT)
+            std::printf("qwen4exp qwen35moe flint\n");
+#elif defined(STRATA_HAVE_QWEN35)
             std::printf("qwen4exp qwen35moe\n");
+#elif defined(STRATA_HAVE_FLINT)
+            std::printf("qwen4exp flint\n");
 #else
             std::printf("qwen4exp\n");
 #endif
@@ -2991,6 +2998,22 @@ int main(int argc, char** argv) {
             // not readable here: the normal path below reports it
         }
         if (qwen35) return strata::qwen35::run(argc, argv);
+        break;
+    }
+#endif
+#if defined(STRATA_HAVE_FLINT)
+    // **THE FLINT SWITCH.**  A Flint file (GGUF architecture flint) runs on its own engine path (src/flint), decided from
+    // the header the same way as the Qwen3.6 one above.
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--native") != 0 && std::strcmp(argv[i], "--model") != 0) continue;
+        bool flint = false;
+        try {
+            const strata::GgufFile meta(strata::gguf_split_paths(argv[i + 1]).front());
+            flint = strata::model_family(meta) == strata::ModelFamily::Flint;
+        } catch (const std::exception&) {
+            // not readable here: the normal path below reports it
+        }
+        if (flint) return strata::flint::run(argc, argv);
         break;
     }
 #endif
