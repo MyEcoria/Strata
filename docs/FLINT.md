@@ -6,8 +6,10 @@ Strata runs it with its own engine, `strata-flint`. This page says what works, w
 
 > **Status.** A first engine, tested on one machine. It runs from the command line on token ids and behind Strata's server
 > (OpenAI and Anthropic APIs, reasoning, tool calls, streaming). One request at a time, no pictures. Linux with an AMD card
-> only. There is no ready-made engine package that includes it yet, so it is installed from a source checkout. Speed: a long
-> prompt is read at over 1,100 tokens/s; the answer comes at about 25-30 tokens/s (see "Measured": what limits it).
+> only. There is no ready-made engine package that includes it yet, so it is installed from a source checkout. Speed on the test
+> machine (16 GB card, 15 GB RAM): a long prompt is read at about 1,150 tokens/s and the answer comes at 55 to 65 tokens/s,
+> because there every expert fits in the card or in page-locked RAM. With less RAM the rest is read from the disk and the answer
+> is slower (see "Measured").
 
 ## What you need
 
@@ -53,60 +55,63 @@ The ids come from the model's tokenizer (for example `llama-tokenize --ids`). Th
 
 ## How the experts are stored
 
-Flint does not fit in 16 GB at Q4 (the experts are 23.4 GB). `strata-flint` keeps them on three levels:
+Flint does not fit in 16 GB at Q4 (the experts are 21.8 GiB). `strata-flint` keeps them on three levels:
 
-1. **VRAM.** A cache with the same share of the experts in every MoE layer (about 95 to 150 of 256 on a 16 GB card), least
+1. **VRAM.** A cache with the same share of the experts in every MoE layer (about 100 to 160 of 256 on a 16 GB card), least
    recently used first.
-2. **Host RAM.** What the VRAM cache gives up is copied down here by asynchronous DMA, and comes back the same way. The area is
-   page-locked (`--no-pin-host` turns that off, which is slower) and sized from `MemAvailable` less 3 GiB, at most two thirds of the RAM (`--host-cache GiB`).
-3. **The file.** Experts in neither level are read with parallel `O_DIRECT` reads. The disk reached about 1.8 GB/s for these
-   reads whatever their size.
+2. **Host RAM.** The experts that are not in the VRAM cache: page-locked memory that the GPU reads in place, over the bus,
+   when a layer asks for one of them (a layer's experts that are in neither level are read from the file into it first). An
+   expert asked for 12 times outside the VRAM cache is swapped with the least recently used one of the cache, in the background
+   (`STRATA_FLINT_PROMOTE_AFTER`). The area is sized from `MemAvailable` less 2.5 GiB, at most 70% of the RAM, and never more than
+   the experts the VRAM cache leaves out (`--host-cache GiB`; `--no-pin-host` turns the page-locking off, which is slower).
+3. **The file.** An expert in neither level is read with parallel `O_DIRECT` reads. The disk reached about 1.7 GB/s for these.
 
-At start the first experts of every layer fill the first two levels (about 19 GiB, 12 s, once): a prompt then finds them there,
-and the decode starts with something to hit. If everything fits in VRAM, the experts are simply resident.
+At start the first experts of every layer fill the first two levels (about 21 GiB, 14 s, once). On the test machine the two levels
+hold all of Flint's experts (VRAM 11.3 GiB, RAM 10.2 GiB), so a decode never touches the file. The token-embedding table (0.3 GiB)
+is kept in RAM so that its VRAM goes to the cache: every 0.3 GiB of VRAM was worth about 3 tokens/s of decode.
 
 **A long prompt** (more than 64 tokens) takes another path, built from the pieces Strata uses for its other models on this card:
 the dense projections are FP16 GEMMs on the matrix cores, the attention is batched GEMMs per KV head with the sink in the softmax,
 and the routed experts go through llama.cpp's int8 MMQ kernels in groups of 16 experts. A thread has each group's experts waiting
 in a ring of buffers (copied from the VRAM cache, from the host tier, or read from the file by a second thread a few layers
-ahead), so the GPU does not wait for the host. The prompt is cut into near-equal chunks of at most 4096 tokens (`--chunk`):
-every chunk is a pass over all the experts. Needs a build with `STRATA_PREFILL_MMQ` (setup turns it on for AMD).
+ahead), so the GPU does not wait for the host. The prompt is cut into near-equal chunks of at most 2048 tokens (`--chunk`):
+every chunk is a pass over all the experts. A bigger chunk reads a long prompt faster (1,345 tokens/s at 4096) but its buffers take
+VRAM from the expert cache, and the decode loses speed (about 3 tokens/s per 1000 tokens of chunk). Needs a build with
+`STRATA_PREFILL_MMQ` (setup turns it on for AMD).
 
 ## Measured
 
-Machine: RX 9070 (gfx1201, 16 GB), Ryzen 5 5600, 15 GB RAM, NVMe (3 GB/s sequential, about 1.8 GB/s for 1-2 MB random reads),
-Ubuntu 26.10, engine built from this tree. File: `flint-UD-Q4_K_XL.gguf`.
+Machine: RX 9070 (gfx1201, 16 GB), Ryzen 5 5600, 15 GB RAM (about 2.6 GB left while Flint runs), NVMe (about 1.7 GB/s for
+1-2 MB random reads), Ubuntu 26.10, engine built from this tree, defaults, a context of 16,384. File: `flint-UD-Q4_K_XL.gguf`.
 
 | | Result |
 | --- | --- |
-| Prompt, 6,281 tokens of code, through the server (default chunk) | 5.4 s, **1,153 tokens/s** |
-| Prompt, 6,379 tokens, `strata-flint`, two chunks of 3,190 | 5.5 s, 1,164 tokens/s |
-| Prompt, 1,000 tokens | 2.1 s (487 tokens/s) |
-| Prompt, 300 tokens | 2.0 s (151 tokens/s) |
-| Prompt, 100 tokens | 1.9 s (52 tokens/s) |
-| The same question asked again about the same text | 6,270 of 6,278 tokens reused, 8 read in 0.23 s |
-| Decode, through the server | 24 to 31 tokens/s |
-| Decode, `strata-flint`, 700 tokens | 25.6 tokens/s (chunk 4096), 27.6 (chunk 2048) |
-| Start (caches filled) | about 19 s |
+| Prompt, 6,321 tokens of code, through the server | 5.5 s, **1,151 tokens/s** |
+| Prompt, 6,379 tokens, `strata-flint` | 5.5 s, 1,160 tokens/s |
+| Prompt, 1,000 tokens | 0.95 s (1,056 tokens/s) |
+| The same question about the same text, asked again | 6,310 of 6,318 tokens reused, 8 read in 0.06 s |
+| Decode, 8 different questions (stories, code, a table, a poem), 700 sampled tokens each (temperature 1, top_p 0.95, top_k 20) | **63.7 tokens/s** on average (59 to 66 per answer), no read from the file |
+| Decode, through the server, answering about the 6,321-token file | 54.6 and 61.3 tokens/s |
+| Decode, greedy, a text that repeats | 60 tokens/s after 600 steps (the best case, not the typical one) |
+| Start (model loaded, caches filled) | about 20 s |
 
-**What limits the prompt.** Every chunk streams all the experts through the card. With the caches full, 10% of them (about
-2.2 GB) still come from the file: 1.6 s per chunk, hidden behind the compute of a big chunk but not of a small one. So any
-prompt of up to about a thousand tokens takes about 2 s, and the speed climbs with the length up to the compute: 2,048 tokens in
-1.18 s, 1,729 tokens/s, with no file reads.
+The decode went through these steps on this machine (the sampled questions above, except the first lines): the experts swapped
+into VRAM before each use 27 tokens/s, a lean step that reads the host tier in place 34, with a bigger host tier (9.9 GiB) 49, with
+the embedding table in RAM 50, with a tier large enough for every expert (10.2 GiB) and short prompts read in place 63.7. The
+step is now 15.7 ms: 13.4 ms of GPU (10.7 ms is the floor measured with every expert in VRAM, `--bench-floor`; the rest is the GPU
+reading about 40 experts per step from RAM over the bus) and the host's share.
 
-**What limits the decode.** A step costs about 35 ms. The GPU part, measured with every expert a hit and no host work, is
-**10.7 ms** (93 tokens/s; it was 21 ms until a router kernel that did its top-6 selection in one thread was replaced by a parallel
-one); a HIP graph does not change it (10.7 ms): the kernels, about 10 µs each, are the cost, not their launches. The rest is the
-experts that are not in the VRAM cache: about 45 per step come back from the host tier, about 6 to 10 are read from the file
-(14 ms per step at the start, about 9 ms once the cache has adapted: 1.8 MB per expert at 1.8 GB/s). Flint's routing is flat
-(a cache of 48, 96 and 160 experts per layer hits 50%, 75% and 93% of the choices), so the 4 GB that do not fit in VRAM and RAM are
-still asked for by about 2% of the choices. **Reading experts straight from the host memory** (an experiment, `STRATA_FLINT_DIRECT=1`)
-measured slower (40 ms), and a lookahead that guesses the next layer's experts (`--prefetch`) gave no gain: they remove copies,
-not the file reads. With all the experts in VRAM and RAM there would be no file read and the step would be close to the 10.7 ms
-plus the host-tier traffic; that needs about 4 GB more RAM, or a smaller file than Q4_K_XL. Not measured.
+**What limits it.** Memory. With a tier of 8.8 GiB (what the machine's free RAM gave before it was sized better) 2% of the choices
+went to the file and the decode was 34 tokens/s; with 9.9 GiB, 49. A machine with less RAM or a smaller card than this one will
+be between those numbers and 64. The VRAM is part of it too: a context of 32,768 cells instead of 16,384 takes 0.43 GiB of the
+cache (about 2.5 tokens/s). A lookahead that reads the next layers' guessed experts from the file ahead of time was tried and
+removed: the experts that reach the file are the rarely used ones, and the guess finds them 1 time in 7 (lookahead of 3 layers:
+23 tokens/s). A second stream for the shared expert (42 against 49 tokens/s), reading with the page cache (45 against 49) and splitting the file
+reads (the same) lost or gave nothing; a replacement policy by frequency (simulated on a recorded trace: 5% fewer reads) is not worth
+its code; fusing the attention's residual add, the norm and the quantizer into one kernel gave 0.4 tokens/s.
 
-Other levels tried on the same machine, for the history: VRAM cache only 85 ms per token; with a host tier that is not
-page-locked 55 ms; with the page-locked tier 36 ms; with the router fixed 35 ms (the step was 46 ms before).
+**What limits the prompt.** Every chunk streams all the experts through the card; the compute alone is 1,729 tokens/s at 2048.
+With every expert in memory, a prompt of up to a thousand tokens takes about a second.
 
 ## Checked against llama.cpp
 
@@ -128,13 +133,13 @@ means. The noise floor of llama.cpp on a GPU, with the same q8_1 activations as 
 
 ## Not done
 
-- **Decode is at 25-30 tokens/s, not 60.** The GPU part would allow about 90, the file reads and expert copies take the rest (see
-  above). Closing that needs more RAM or a smaller file, not a faster kernel.
+- The decode speed needs the RAM described above. Not tried on another machine; a card with more memory or a machine with more
+  RAM should be at least as fast, one with less is slower.
 - No ready-made engine package includes Flint, so `strata launch` and the app cannot install it yet.
 - One request at a time (no `--parallel`), no pictures, no speculative decoding. Greedy and sampled decoding only.
 - A conversation that diverges more than 512 tokens before its end is read again from the start (see above): about 5 s for
   6,000 tokens.
-- A short prompt costs about 2 s whatever its length (up to ~1,000 tokens), because every chunk is a pass over all the experts.
 - Not built or run on CUDA, Windows or Mac.
-- More RAM would help: the second level is limited by what the system can spare. Not measured.
+- The page-locked tier leaves little RAM free (2.6 GB on 15 GB): `--host-cache` takes less if the machine is also used for
+  other things.
 - Only the Q4_K_XL file was run. The other Flint files were not tested and are not offered by setup.

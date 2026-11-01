@@ -26,6 +26,8 @@
 #include "strata/flint/engine.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/dp4a.hpp"
+#include "strata/kernels/q8_1_finite.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/qwen35/sampling.hpp"
@@ -164,6 +166,63 @@ __global__ void k_gemv_f32(const float* W, const float* x, float* y, int n_in, i
     }
     for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, m);
     if (lane == 0) y[(size_t) blockIdx.y * n_out + o] = acc;
+}
+
+// ------------------------------------------------------------------------------------------------ fused decode kernel
+/// k_add (x += y), k_rms (h = rms(x) * w) and the q8_1 image of h (what native_quantize_q8_1 writes) in one launch, one block of 256
+/// per row.  The arithmetic is that of the three kernels it replaces, in the same order (the Qwen3.6 engine's k_add_rms_q, written
+/// to give their bits; the logits of a forced run are identical with and without it: STRATA_FLINT_NO_FUSE=1).
+struct Q8Blk {
+    __half2 ds;
+    int8_t qs[32];
+};
+static_assert(sizeof(Q8Blk) == 36, "q8_1 block");
+__device__ __forceinline__ float fw_sum(float v) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o, 32);
+    return v;
+}
+__device__ __forceinline__ float fw_max(float v) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o, 32));
+    return v;
+}
+__device__ __forceinline__ void q8_put(Q8Blk* __restrict__ y, int i, float v, int lane) {
+    const float amax = fw_max(fabsf(v));
+    const float sum = fw_sum(v);
+    const float d = strata::kernels::q8_1_finite(amax / 127.0f);
+    int8_t q = 0;
+    if (amax != 0.0f) {
+        const float qf = roundf(v / d);
+        q = (int8_t) (qf > 127.0f ? 127.0f : qf < -127.0f ? -127.0f : qf);
+    }
+    y[i >> 5].qs[lane] = q;
+    if (lane == 0) y[i >> 5].ds = strata::kernels::q8_1_ds(d, sum);
+}
+__global__ void __launch_bounds__(256) k_add_rms_q8(float* x, const float* y, const float* w, float* h, Q8Blk* hq, int n, float eps) {
+    __shared__ float sh[256];
+    float* xr = x + (size_t) blockIdx.x * n;
+    const float* yr = y + (size_t) blockIdx.x * n;
+    float* hr = h + (size_t) blockIdx.x * n;
+    Q8Blk* qr = hq + (size_t) blockIdx.x * (n >> 5);
+    float s = 0.f;
+    for (int i = threadIdx.x; i < n; i += 256) {
+        const float v = xr[i] + yr[i];
+        xr[i] = v;
+        s += v * v;
+    }
+    sh[threadIdx.x] = s;
+    __syncthreads();
+    for (int o = 128; o > 0; o >>= 1) {
+        if ((int) threadIdx.x < o) sh[threadIdx.x] += sh[threadIdx.x + o];
+        __syncthreads();
+    }
+    const float r = rsqrtf(sh[0] / (float) n + eps);
+    for (int i = threadIdx.x; i < n; i += 256) {
+        const float hv = __fmul_rn(__fmul_rn(xr[i], r), w[i]);   // no FMA with the quantizer's sums
+        hr[i] = hv;
+        q8_put(qr, i, ((volatile float*) hr)[i], threadIdx.x & 31);
+    }
 }
 unsigned rows8(int n) { return (unsigned) ((n + 7) / 8); }
 unsigned grid1(int64_t n, int b = kThreads) { return (unsigned) ((n + b - 1) / b); }
@@ -907,10 +966,13 @@ struct Engine {
     bool host_inplace = false;      // the decode reads host-tier experts where they are and promotes the repeated ones in the background
     int promote_after = 12;
     cudaStream_t st_pro = nullptr;  // the promotions' copies
-    cudaEvent_t ev_pro = nullptr;
+    cudaEvent_t ev_pro = nullptr, ev_kd = nullptr;   // ev_kd: the expert kernel of the call is done
+    FILE* trace_f = nullptr;
     int32_t* h_ids = nullptr;
     uint8_t *h_meta = nullptr, *d_meta = nullptr;
-    static constexpr size_t kMetaGP = 0, kMetaGS = 512, kMetaNG = 768, kMetaED = 832, kMetaET = 1024, kMetaBytes = 1216;
+    // (for up to kFastEnt = 64 tokens x 6 experts: groups, group starts, their count, the entries' slots and tokens)
+    static constexpr int kFastEnt = 384;
+    static constexpr size_t kMetaGP = 0, kMetaGS = 3072, kMetaNG = 4624, kMetaED = 4640, kMetaET = 6176, kMetaBytes = 7712;
     bool fake_hit = false, skip_tok_copy = false;   // --bench-floor
     // --bench-floor: where the GPU time of a decode step goes, by section (events between the sections)
     bool secprof = false;
@@ -985,6 +1047,7 @@ struct Engine {
         CK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
         CK(cudaStreamCreateWithFlags(&st_pro, cudaStreamNonBlocking));
         CK(cudaEventCreateWithFlags(&ev_pro, cudaEventDisableTiming));
+        CK(cudaEventCreateWithFlags(&ev_kd, cudaEventDisableTiming));
         cs = st;
         const size_t N = (size_t) m->N, T = (size_t) tmax, K_ = (size_t) m->TK;
         auto dal = [](size_t n) {
@@ -1060,7 +1123,8 @@ struct Engine {
         CK(cudaMalloc(&tmp_blobs, tmp_stride * (size_t) pin_slots + 4096));
         pin_cap = round_up(max_part + 8192, 4096);
         CK(cudaHostAlloc((void**) &swap_tmp, tmp_stride + 4096, cudaHostAllocDefault));
-        CK(cudaHostAlloc((void**) &h_ids, 64 * 4, cudaHostAllocDefault));
+        CK(cudaHostAlloc((void**) &h_ids, kFastEnt * 4, cudaHostAllocDefault));
+        if (const char* tf = std::getenv("STRATA_FLINT_TRACE")) trace_f = std::fopen(tf, "wb");
         CK(cudaHostAlloc((void**) &h_meta, kMetaBytes, cudaHostAllocDefault));
         CK(cudaMalloc(&d_meta, kMetaBytes));
         CK(cudaHostAlloc((void**) &pin, pin_cap * 3 * (size_t) pin_slots, cudaHostAllocDefault));
@@ -1187,11 +1251,11 @@ struct Engine {
                 if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) break;
             }
             std::fclose(f);
-            // what the system can spare less 3 GiB (the rest of the engine's pinned buffers, the server, the system), and at most
-            // two thirds of the RAM: MemAvailable counts a page cache that the pinned tier will push out
-            const size_t avail = (size_t) kb * 1024, margin = (size_t) (3.0 * (double) (1ull << 30));
+            // what the system can spare less 2.5 GiB (the rest of the engine's pinned buffers, the server, the system), and at most
+            // 70% of the RAM: MemAvailable counts a page cache that the pinned tier will push out
+            const size_t avail = (size_t) kb * 1024, margin = (size_t) (2.5 * (double) (1ull << 30));
             host_bytes = avail > margin ? avail - margin : 0;
-            if (tot > 0) host_bytes = std::min<size_t>(host_bytes, (size_t) ((double) tot * 1024.0 * 0.66));
+            if (tot > 0) host_bytes = std::min<size_t>(host_bytes, (size_t) ((double) tot * 1024.0 * 0.70));
         }
         size_t host_used = 0;
         int min_h = 1 << 30, max_h = 0;
@@ -1313,12 +1377,13 @@ struct Engine {
         const Model& M = *m;
         if (std::getenv("STRATA_FLINT_NO_WARM")) return;
         const auto t0 = Clock::now();
+        // in pieces of 64 experts: the staging buffers are 3 x 64 experts (about 0.1 GiB), not 3 whole layers
+        constexpr int kPiece = 64;
         size_t gmax = 0, dmax = 0;
         for (const Layer& L : M.layers)
             if (!L.dense && L.S > 0) {
-                const size_t n = std::min<size_t>((size_t) M.NE, (size_t) (L.S + L.Sh));
-                gmax = std::max(gmax, n * L.src_gsz);
-                dmax = std::max(dmax, n * L.src_dsz);
+                gmax = std::max(gmax, (size_t) kPiece * L.src_gsz);
+                dmax = std::max(dmax, (size_t) kPiece * L.src_dsz);
             }
         constexpr size_t kSlack = (8u << 20) + 3 * 4096;
         uint8_t *bg = nullptr, *bu = nullptr, *bd = nullptr;
@@ -1336,34 +1401,40 @@ struct Engine {
             const Layer& L = M.layers[l];
             if (L.dense || L.S <= 0 || resident[l]) continue;
             const int n = (int) std::min<size_t>((size_t) M.NE, (size_t) (L.S + L.Sh));
-            read_range(L.off_g, (size_t) n * L.src_gsz, bg);
-            read_range(L.off_u, (size_t) n * L.src_gsz, bu);
-            read_range(L.off_d, (size_t) n * L.src_dsz, bd);
-            bytes += (size_t) n * (2 * L.src_gsz + L.src_dsz);
-            const uint8_t* g0 = bg + (L.off_g & 4095);
-            const uint8_t* u0 = bu + (L.off_u & 4095);
-            const uint8_t* d0 = bd + (L.off_d & 4095);
-            for (int e = 0; e < n; ++e) {
-                if (e < L.S) {   // the VRAM cache: slot e holds expert e
-                    uint8_t* dst = L.cblob + (size_t) e * L.stride;
-                    CK(cudaMemcpyAsync(dst, g0 + (size_t) e * L.src_gsz, L.src_gsz, cudaMemcpyHostToDevice, st));
-                    CK(cudaMemcpyAsync(dst + L.L.up_off, u0 + (size_t) e * L.src_gsz, L.src_gsz, cudaMemcpyHostToDevice, st));
-                    CK(cudaMemcpyAsync(dst + L.L.down_off, d0 + (size_t) e * L.src_dsz, L.src_dsz, cudaMemcpyHostToDevice, st));
-                    L.slot_exp[(size_t) e] = e;
-                    L.exp_slot[(size_t) e] = e;
-                    L.slot_use[(size_t) e] = 0;
-                } else {         // the host tier: slot e - S
-                    const int hs = e - L.S;
-                    uint8_t* dst = L.hblob + (size_t) hs * L.stride;
-                    std::memcpy(dst, g0 + (size_t) e * L.src_gsz, L.src_gsz);
-                    std::memcpy(dst + L.L.up_off, u0 + (size_t) e * L.src_gsz, L.src_gsz);
-                    std::memcpy(dst + L.L.down_off, d0 + (size_t) e * L.src_dsz, L.src_dsz);
-                    L.hslot_exp[(size_t) hs] = e;
-                    L.hexp_slot[(size_t) e] = hs;
-                    L.hslot_use[(size_t) hs] = 0;
+            for (int e0 = 0; e0 < n; e0 += kPiece) {
+                const int cnt = std::min(kPiece, n - e0);
+                const uint64_t og = L.off_g + (uint64_t) e0 * L.src_gsz, ou = L.off_u + (uint64_t) e0 * L.src_gsz,
+                               od = L.off_d + (uint64_t) e0 * L.src_dsz;
+                read_range(og, (size_t) cnt * L.src_gsz, bg);
+                read_range(ou, (size_t) cnt * L.src_gsz, bu);
+                read_range(od, (size_t) cnt * L.src_dsz, bd);
+                bytes += (size_t) cnt * (2 * L.src_gsz + L.src_dsz);
+                const uint8_t* g0 = bg + (og & 4095);
+                const uint8_t* u0 = bu + (ou & 4095);
+                const uint8_t* d0 = bd + (od & 4095);
+                for (int e = e0; e < e0 + cnt; ++e) {
+                    const size_t k = (size_t) (e - e0);
+                    if (e < L.S) {   // the VRAM cache: slot e holds expert e
+                        uint8_t* dst = L.cblob + (size_t) e * L.stride;
+                        CK(cudaMemcpyAsync(dst, g0 + k * L.src_gsz, L.src_gsz, cudaMemcpyHostToDevice, st));
+                        CK(cudaMemcpyAsync(dst + L.L.up_off, u0 + k * L.src_gsz, L.src_gsz, cudaMemcpyHostToDevice, st));
+                        CK(cudaMemcpyAsync(dst + L.L.down_off, d0 + k * L.src_dsz, L.src_dsz, cudaMemcpyHostToDevice, st));
+                        L.slot_exp[(size_t) e] = e;
+                        L.exp_slot[(size_t) e] = e;
+                        L.slot_use[(size_t) e] = 0;
+                    } else {         // the host tier: slot e - S
+                        const int hs = e - L.S;
+                        uint8_t* dst = L.hblob + (size_t) hs * L.stride;
+                        std::memcpy(dst, g0 + k * L.src_gsz, L.src_gsz);
+                        std::memcpy(dst + L.L.up_off, u0 + k * L.src_gsz, L.src_gsz);
+                        std::memcpy(dst + L.L.down_off, d0 + k * L.src_dsz, L.src_dsz);
+                        L.hslot_exp[(size_t) hs] = e;
+                        L.hexp_slot[(size_t) e] = hs;
+                        L.hslot_use[(size_t) hs] = 0;
+                    }
                 }
+                CK(cudaStreamSynchronize(st));   // the staging buffers are read again by the next piece
             }
-            CK(cudaStreamSynchronize(st));   // the staging buffers are read again by the next layer
         }
         CK(cudaFreeHost(bg));
         CK(cudaFreeHost(bu));
@@ -1433,8 +1504,8 @@ struct Engine {
                                        ent_tok);
             K::native_expert_grouped(L.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, std::min<int64_t>(n_ent, M.NE),
                                      n_ent, xq, escr, eparts, st);
-        } else if (T <= 8 && !host_direct && !fake_hit && !prof_predict && prefetch_k <= 0 && L.S >= 48) {
-            moe_fast(L, li, T);
+        } else if (T <= 64 && !host_direct && !fake_hit && !prof_predict && prefetch_k <= 0 && L.S >= 48) {
+            if (!moe_fast(L, li, T)) moe_cached(L, li, T);
         } else {
             moe_cached(L, li, T);
         }
@@ -1591,16 +1662,24 @@ struct Engine {
     /// makes (hits in the VRAM cache, the others brought in by load_experts), with the host work cut to what it needs: the ids come
     /// back in a pinned array, nothing is allocated, the groups go to the card in one pinned block with one copy, and the kernel
     /// is queued at once (the stream orders the copy before it).
-    void moe_fast(const Layer& L, size_t li, int T) {
+    bool moe_fast(const Layer& L, size_t li, int T) {
         const Model& M = *m;
         const int Kp = (int) M.TK, n_ent = T * Kp;
         const auto tp0 = Clock::now();
         CK(cudaMemcpyAsync(h_ids, ids, (size_t) n_ent * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
         if (prof) t_sync += ms_since(tp0);
-        // the entries sorted by (expert, entry): ord[i] = expert * 64 + entry
-        int ord[48];
-        for (int e = 0; e < n_ent; ++e) ord[e] = h_ids[e] * 64 + e;
+        if (trace_f && T == 1) {   // STRATA_FLINT_TRACE=<file>: layer (u8), then the Kp expert ids (u16) of every decode step's layer
+            const uint8_t lb = (uint8_t) li;
+            std::fwrite(&lb, 1, 1, trace_f);
+            for (int e = 0; e < n_ent; ++e) {
+                const uint16_t v = (uint16_t) h_ids[e];
+                std::fwrite(&v, 2, 1, trace_f);
+            }
+        }
+        // the entries sorted by (expert, entry): ord[i] = expert * 512 + entry
+        int ord[kFastEnt];
+        for (int e = 0; e < n_ent; ++e) ord[e] = h_ids[e] * 512 + e;
         std::sort(ord, ord + n_ent);
         ++clock_;
         for (const auto& pf_ : L.pfree)   // experts promoted to the VRAM at an earlier call: their host copy is released now
@@ -1611,8 +1690,8 @@ struct Engine {
         L.pfree.clear();
         std::vector<int32_t> misses;   // not in the VRAM cache
         for (int i = 0; i < n_ent; ++i) {
-            const int xk = ord[i] >> 6;
-            if (i > 0 && (ord[i - 1] >> 6) == xk) continue;
+            const int xk = ord[i] >> 9;
+            if (i > 0 && (ord[i - 1] >> 9) == xk) continue;
             if (L.exp_slot[(size_t) xk] >= 0) L.slot_use[(size_t) L.exp_slot[(size_t) xk]] = clock_;
             else misses.push_back(xk);
         }
@@ -1620,9 +1699,10 @@ struct Engine {
             ++n_calls;
             total_ += n_ent;
             for (int i = 0; i < n_ent; ++i)
-                if (L.exp_slot[(size_t) (ord[i] >> 6)] >= 0) ++hits_;
+                if (L.exp_slot[(size_t) (ord[i] >> 9)] >= 0) ++hits_;
         }
-        const bool inplace = host_inplace && L.hdev != nullptr && L.Sh >= n_ent;
+        const bool inplace = host_inplace && L.hdev != nullptr && (size_t) L.Sh >= misses.size();   // (all of the call's host experts at once)
+        if (T > 8 && !inplace) return false;   // (a prompt chunk that wants more than the host tier holds: the rounds of moe_cached)
         if (inplace) {
             std::vector<int32_t> ssd;
             for (int32_t xk : misses) {
@@ -1669,9 +1749,9 @@ struct Engine {
         int32_t* et = (int32_t*) (h_meta + kMetaET);
         int ng = 0, ne_ = 0;
         for (int i = 0; i < n_ent;) {
-            const int xk = ord[i] >> 6;
+            const int xk = ord[i] >> 9;
             int j = i;
-            while (j < n_ent && (ord[j] >> 6) == xk) ++j;
+            while (j < n_ent && (ord[j] >> 9) == xk) ++j;
             const unsigned long long blob = L.exp_slot[(size_t) xk] >= 0
                                                 ? (unsigned long long) (L.cblob + (size_t) L.exp_slot[(size_t) xk] * L.stride)
                                                 : (unsigned long long) (L.hdev + (size_t) L.hexp_slot[(size_t) xk] * L.stride);
@@ -1680,8 +1760,8 @@ struct Engine {
                 gs[ng] = ne_;
                 ++ng;
                 for (int b = a; b < std::min(j, a + (int) kGroupEntries); ++b) {
-                    ed[ne_] = ord[b] & 63;
-                    et[ne_] = (ord[b] & 63) / Kp;
+                    ed[ne_] = ord[b] & 511;
+                    et[ne_] = (ord[b] & 511) / Kp;
                     ++ne_;
                 }
             }
@@ -1694,6 +1774,7 @@ struct Engine {
                                  (const int32_t*) (d_meta + kMetaNG), (const int32_t*) (d_meta + kMetaED),
                                  (const int32_t*) (d_meta + kMetaET), (int64_t) ng, (int64_t) ne_, xq, escr, eparts, st);
         if (inplace) {   // the experts used again and again outside the VRAM cache move in, in the background
+            CK(cudaEventRecord(ev_kd, st));
             for (int32_t xk : misses) {
                 if (L.exp_slot[(size_t) xk] >= 0) continue;
                 if (L.hot[(size_t) xk] < 255) ++L.hot[(size_t) xk];
@@ -1701,6 +1782,7 @@ struct Engine {
             }
         }
         (void) li;
+        return true;
     }
 
     /// A slot of the host tier to give away: an empty one, else the least recently used that is not in use (this call's clock
@@ -1736,15 +1818,25 @@ struct Engine {
         const int V = L.slot_exp[(size_t) v];
         uint8_t* vdst = L.cblob + (size_t) v * L.stride;
         if (V >= 0) {
-            const int hv = host_lru(L, hs);
-            if (hv >= 0) {   // V goes down to the host tier
-                if (L.hslot_exp[(size_t) hv] >= 0) L.hexp_slot[(size_t) L.hslot_exp[(size_t) hv]] = -1;
-                CK(cudaMemcpyAsync(L.hblob + (size_t) hv * L.stride, vdst, L.L.bytes, cudaMemcpyDeviceToHost, st_pro));
-                L.hslot_exp[(size_t) hv] = V;
-                L.hexp_slot[(size_t) V] = hv;
-                L.hslot_use[(size_t) hv] = clock_;
-            }
+            // x (host slot hs) and V (VRAM slot v) swap places, so the host tier keeps as many experts as it had: V goes through a
+            // VRAM scratch, x goes into the slot, V takes x's host slot once the expert kernel of this call has finished reading
+            // x there (ev_kd).  All on the promotion stream; the next step waits for it.
+            CK(cudaStreamWaitEvent(st_pro, ev_kd, 0));
+            CK(cudaMemcpyAsync(tmp_blobs, vdst, L.L.bytes, cudaMemcpyDeviceToDevice, st_pro));
+            CK(cudaMemcpyAsync(vdst, L.hblob + (size_t) hs * L.stride, L.L.bytes, cudaMemcpyHostToDevice, st_pro));
+            CK(cudaMemcpyAsync(L.hblob + (size_t) hs * L.stride, tmp_blobs, L.L.bytes, cudaMemcpyDeviceToHost, st_pro));
             L.exp_slot[(size_t) V] = -1;
+            L.hexp_slot[(size_t) xk] = -1;
+            L.hslot_exp[(size_t) hs] = V;
+            L.hexp_slot[(size_t) V] = hs;
+            L.hslot_use[(size_t) hs] = clock_;
+            L.slot_exp[(size_t) v] = xk;
+            L.exp_slot[(size_t) xk] = v;
+            L.slot_use[(size_t) v] = clock_;
+            L.hot[(size_t) xk] = 0;
+            pro_pending = true;
+            ++demoted_;
+            return;
         }
         CK(cudaMemcpyAsync(vdst, L.hblob + (size_t) hs * L.stride, L.L.bytes, cudaMemcpyHostToDevice, st_pro));
         L.slot_exp[(size_t) v] = xk;
@@ -2487,7 +2579,7 @@ struct Engine {
     }
 
     /// The attention block of layer li for T tokens at positions p0 ..: x += wo(attn(norm(x))).  h holds norm(x).
-    void attention(const Layer& L, size_t li, int T, int p0) {
+    void attention(const Layer& L, size_t li, int T, int p0, bool fuse_add = false) {
         const Model& M = *m;
         const int H = (int) M.H, HKV = (int) M.HKV, N = (int) M.N;
         quant(h, N, T, xq);
@@ -2509,7 +2601,7 @@ struct Engine {
         }
         quant(att, H * kHD, T, q8);
         mm(L.wo, q8, y, T);
-        k_add<<<grid1((int64_t) T * N), kThreads, 0, st>>>(x, y, (int64_t) T * N);
+        if (!fuse_add) k_add<<<grid1((int64_t) T * N), kThreads, 0, st>>>(x, y, (int64_t) T * N);   // (fuse_add: the next kernel adds it)
     }
 
     /// T tokens (host ids) at positions p0 ..; with `want_logits` the last row's logits are left in lg.
@@ -2531,8 +2623,11 @@ struct Engine {
             const Layer& L = M.layers[l];
             k_rms<<<T, kThreads, 0, st>>>(x, L.attn_norm, h, N, M.eps);
             mark("rms_attn");
+            // Outside the prompt path the attention's residual add, the FFN's norm and the q8_1 image of its input are one kernel
+            // (whose arithmetic is k_add + k_rms + the quantizer: same bits).
+            const bool fuse = !pf && !secprof && !std::getenv("STRATA_FLINT_NO_FUSE");
             if (pf) attention_pf(L, l, T, p0);
-            else attention(L, l, T, p0);
+            else attention(L, l, T, p0, fuse);
             mark("attention");
             if (pf && finite_check) {
                 if (!d_cnt) CK(cudaMalloc(&d_cnt, 4));
@@ -2544,13 +2639,20 @@ struct Engine {
                 if (hc) std::fprintf(stderr, "finite check: layer %zu after the attention (%s): %d non-finite values in x\n", l,
                                      L.swa ? "window" : "full", hc);
             }
-            k_rms<<<T, kThreads, 0, st>>>(x, L.ffn_norm, h, N, M.eps);
-            mark("rms_ffn");
+            if (fuse) {
+                k_add_rms_q8<<<T, 256, 0, st>>>(x, y, L.ffn_norm, h, (Q8Blk*) xq, N, M.eps);
+                mark("add_rms_quant");
+            } else {
+                k_rms<<<T, kThreads, 0, st>>>(x, L.ffn_norm, h, N, M.eps);
+                mark("rms_ffn");
+            }
             if (pf) {
                 ffn_pf(L, l, T);
             } else {
-                quant(h, N, T, xq);
-                mark("quantize");
+                if (!fuse) {
+                    quant(h, N, T, xq);
+                    mark("quantize");
+                }
                 ffn(L, l, T);
             }
             mark(L.dense ? "ffn_dense" : "ffn_moe_total");
@@ -2911,7 +3013,7 @@ int strata::flint::run(int argc, char** argv) {
                         "  --max-context N       cells of the KV cache of the full-attention layers (default: prompt + new tokens)\n"
                         "  --chunk N             prompt tokens per forward, 8..4096 (default 2048; 512 without the long-prompt path; every 1000 tokens of chunk takes ~0.3 GiB from the expert cache in VRAM)\n"
                         "  --expert-vram GiB     VRAM for the expert cache (default: what is free after a warmup, less 0.6 GiB)\n"
-                        "  --host-cache GiB      host RAM for the expert tier below it (default: MemAvailable less 3 GiB, at most two thirds of the RAM)\n"
+                        "  --host-cache GiB      host RAM for the expert tier below it (default: MemAvailable less 2.5 GiB, at most 70% of the RAM)\n"
                         "  --no-pin-host         do not page-lock the host tier (slower: its swaps are staged and synchronous)\n"
                         "  --prefetch N          lookahead: bring N guessed experts of the next layer in early (default 0, no gain measured)\n"
                         "  --buffered            read the file through the page cache instead of O_DIRECT (slower)\n"
