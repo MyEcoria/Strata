@@ -4298,6 +4298,15 @@ class Service:
             self.stop_ids = {int(eos)}
             self.parser_cls = dsml.DsmlOutputParser
             self._force_text = dsml.to_dsml_force
+        elif family == "flint":
+            from serve import flint_format
+            # the turn ends on the end-of-text token, or where the model starts another speaker's part
+            names = ("<|end_of_text|>", "<|user|>", "<|observation|>", "<|developer|>")
+            ids = {int(self.tok.ids[n]) for n in names if n in getattr(self.tok, "ids", {})}
+            if ids:
+                self.stop_ids = ids
+            self.parser_cls = flint_format.FlintOutputParser
+            self._force_text = flint_format.to_flint_force
         import serve.frontend as _frontend
         _frontend.use_family(family)
 
@@ -8825,7 +8834,7 @@ def check_request_sampling(req) -> None:
 
 # the API's model name per model family (the GGUF architecture, "arch" in the config) when the config names none
 FAMILY_MODEL_NAMES = {"qwen4exp": "qwen3.8-flash-next", "qwen35moe": "qwen3.6-35b-a3b",
-                      "deepseek41": "deepseek-v4.1-flash"}
+                      "deepseek41": "deepseek-v4.1-flash", "flint": "flint"}
 
 
 # The sampling each model card recommends ("Best Practices"), used when neither the request, the Chat settings nor the
@@ -8840,6 +8849,8 @@ MODEL_CARD_SAMPLING = {
                   "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}},
     # DeepSeek-V4.1-Flash: temperature 1.0, top_p 1.0 for local use (thinking or not), no penalties
     "deepseek41": {"thinking": {"temperature": 1.0, "top_p": 1.0}, "instruct": {"temperature": 1.0, "top_p": 1.0}},
+    # Flint (huggingface.co/RecursiveSI/flint): temperature 1.0, top_p 0.95, top_k 20 (the GGUF carries the same three keys)
+    "flint": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20}, "instruct": {"temperature": 1.0, "top_p": 0.95, "top_k": 20}},
 }
 
 
@@ -8856,6 +8867,8 @@ def arch_from_tokenizer(arch, pre) -> str | None:
     and no DSML tool calls.  The pack's tokenizer says what it is (its pre-tokenizer is "deepseek3"); an arch the config names is never changed."""
     if arch:
         return arch
+    if str(pre or "") == "flint":
+        return "flint"
     return "deepseek41" if str(pre or "").startswith("deepseek") else None
 
 
@@ -9297,6 +9310,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         if swapped:
             print("[strata] this pack's chat template spells the tool-call block differently from the V4.1 model's; "
                   "using the V4.1 template so tool calls come back as real calls", flush=True)
+    if (cfg.get("arch") or "") == "flint" and not tpl.exists():
+        tpl = ROOT / "serve/fixtures/flint/chat_template.jinja"      # the model's own template, when the pack has none
     svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
                   model_name=default_model_name(cfg), vision=vision,
                   sampling_defaults=sampling_defaults,
@@ -9314,7 +9329,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     svc.queue_timeout_s = float(queue_timeout) if queue_timeout is not None else None
     if a.engine == "strata":                            # the model card's sampling when nothing else is said (see MODEL_CARD_SAMPLING)
         svc.model_arch = cfg.get("arch") or "qwen4exp"
-        svc.set_family(svc.model_arch if svc.model_arch == "deepseek41" else None)
+        svc.set_family(svc.model_arch if svc.model_arch in ("deepseek41", "flint") else None)
         requested = cfg.get("parallel")
         if requested is None:
             args = cfg.get("args", [])
