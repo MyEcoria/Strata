@@ -308,7 +308,7 @@ The engine keeps the experts that do not fit on the card in RAM, then reads them
 | Measure | Result |
 | --- | ---: |
 | Prompt, 6,321 tokens of code, through the server | 1,151 tokens/s |
-| Decode, 8 different sampled questions | 63.7 tokens/s (59 to 66) |
+| Decode, 8 different sampled questions | 63.7 tokens/s with a 16,384 context (57.2 with the default 32,768) |
 
 How the experts are stored, how it was checked against llama.cpp, and what is not done: [FLINT.md](FLINT.md).
 

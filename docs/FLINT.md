@@ -7,8 +7,8 @@ Strata runs it with its own engine, `strata-flint`. This page says what works, w
 > **Status.** A first engine, tested on one machine. It runs from the command line on token ids and behind Strata's server
 > (OpenAI and Anthropic APIs, reasoning, tool calls, streaming). One request at a time, no pictures. Linux with an AMD card
 > only. There is no ready-made engine package that includes it yet, so it is installed from a source checkout. Speed on the test
-> machine (16 GB card, 15 GB RAM): a long prompt is read at about 1,150 tokens/s and the answer comes at 55 to 65 tokens/s,
-> because there every expert fits in the card or in page-locked RAM. With less RAM the rest is read from the disk and the answer
+> machine (16 GB card, 15 GB RAM): a prompt is read at 1,000 to 1,300 tokens/s (660 at 30,000 tokens) and the answer comes at 57
+> tokens/s with the default context of 32,768 and 64 with 16,384, because the longer the context the less room the card has for experts. With less RAM the rest is read from the disk and the answer
 > is slower (see "Measured").
 
 ## What you need
@@ -112,6 +112,76 @@ its code; fusing the attention's residual add, the norm and the quantizer into o
 
 **What limits the prompt.** Every chunk streams all the experts through the card; the compute alone is 1,729 tokens/s at 2048.
 With every expert in memory, a prompt of up to a thousand tokens takes about a second.
+
+## Context, KV cache, several clients
+
+**KV cache.** FP16 only (no quantized KV in this engine). It costs about 28 KB per token (measured: 0.94 GiB at 32,768 cells and 7.07 GiB
+at 262,144) plus 0.07 GiB for the rings of the sliding-window layers. The model documents 262,144 tokens as its context. The setup's
+choice for a 16 GB card is **32,768**. The engine starts at every size up to 262,144 on this card, but the KV cache comes out of the
+VRAM that holds experts, so the decode slows down as the context grows (same 8 sampled questions as above, one at a time):
+
+| `--max-context` | KV cache | Experts in VRAM | Decode |
+| --- | ---: | ---: | ---: |
+| 16,384 | 0.51 GiB | 11.3 GiB | 63.7 tokens/s |
+| **32,768 (setup default)** | 0.94 GiB | 10.9 GiB | **57.2 tokens/s** |
+| 65,536 | 1.82 GiB | 9.9 GiB | 45.0 tokens/s |
+| 131,072 | 3.57 GiB | 8.0 GiB | 30.6 tokens/s |
+| 262,144 (the model's maximum) | 7.07 GiB | 4.4 GiB | 17.2 tokens/s |
+
+At 32,768 the two levels are 0.5 GiB short of holding every expert (4,600 reads from the file in 5,600 steps), and a bigger host tier
+did not help: with 10.6 GiB the machine had no page-locked memory left for the start-up fill and the decode fell to 46.8 tokens/s. So on
+this 15 GB machine 60 tokens/s needs a context of 16,384 or less (64 measured); at the default 32,768 it is 57.
+
+**Long prompts** (default context, one request, the model's `<think>` allowed; the numbers of a request after the caches are warm):
+
+| Prompt | Read | Decode after it |
+| --- | ---: | ---: |
+| 5,128 tokens | 1,300 tokens/s (3.9 s) | 59 to 67 tokens/s |
+| 16,127 tokens | 955 tokens/s (16.9 s) | 58 to 61 tokens/s |
+| 27,018 tokens | 698 tokens/s (38.7 s) | 48 tokens/s |
+| 29,812 tokens | 660 tokens/s (45.2 s) | 44 to 50 tokens/s |
+
+The read slows down with the length (the attention of the full-attention layers grows with the square of the length; the experts' share
+does not). Above about 10,000 tokens the prompt is under 1,000 tokens/s. **Needle in a haystack**: a six-digit code hidden in C++ and
+Python source at 10%, 50% and 90% of the text, asked for at the end: found 9 times out of 9, at 5,128, 16,127 and 29,812 tokens
+(generated with the model's thinking; not a measure of how well it handles other long-context tasks).
+
+**Several agents.** The engine runs one request at a time and keeps the tokens of one conversation (see above), so clients queue; there
+is no batching. N agents, each doing 3 turns of 150 tokens on a growing conversation with its own 1,500-token system prompt, sent at once:
+
+| Agents | System prompt | Requests | Aggregate | Latency per request (median, longest) | Prompt tokens read again |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 1 | own | 3 | 47.7 tokens/s | 3.0 s, 3.5 s | 1,490 |
+| 2 | own | 6 | 43.5 tokens/s | 7.1 s, 7.4 s | 8,182 |
+| 4 | own | 12 | 40.9 tokens/s | 10.9 s, 21.9 s | 19,077 |
+| 8 | own | 24 | 40.9 tokens/s | 19.8 s, 52.0 s | 37,118 |
+| 4 | the same for all | 12 | 55.2 tokens/s | 10.9 s, 11.8 s | 2,079 |
+| 8 | the same for all | 24 | 54.3 tokens/s | 11.6 s, 48.6 s | 4,207 |
+
+More agents do not give more tokens per second, they wait in line. Agents with different contexts make the engine read their whole
+conversation again at every switch (a conversation is only continued if it is the one the engine holds); agents that start with the
+same system prompt only re-read what differs, and the aggregate speed stays near the single-client one. The remedy is a second slot
+(`--parallel`), which Flint does not have.
+
+## Accuracy
+
+**Not measured by us against the unquantized model.** The BF16 checkpoint is 80 GB and was not run. What exists:
+
+- *Published for the unquantized model* (Hugging Face model card of `RecursiveSI/flint`, release evaluations, average pass@1 over at
+  least five attempts, on H200/B300 with SGLang): Terminal-Bench 2.1 54.9%, SWE-bench Pro v2 89.7%, SWE-bench Verified 74.2%.
+- *Published for the quantized files*: nothing for Flint. The `unsloth/flint-GGUF` page gives no score or KL divergence and says results
+  vary with checkpoint precision and runtime.
+- *Published for the same kind of file on another model* (Unsloth's Dynamic GGUF page, Gemma 3 27B): UD-Q4_K_XL has a KL divergence of 0.0237
+  from full precision, and MMLU 5-shot of 71.47% against 71.5% for BF16. It is not Flint (a 40B mixture of experts) and says what the
+  quantization costs elsewhere, not here.
+- *Measured here, the engine against llama.cpp on the same Q4_K_XL file*: see "Checked against llama.cpp" below. The mean loss on 1,100 tokens of code is
+  2.4456 for this engine's prompt path (2.4909 before it) against 2.4904 for llama.cpp with F32 attention and 2.4593 with its default;
+  llama.cpp differs from itself by 0.031 between those two settings. The decode path and the changes of this page leave the logits
+  unchanged (KL 0 on 40 forced steps).
+
+So the loss from the unquantized model is that of the Q4_K_XL file (not measured for Flint) plus the engine's difference from llama.cpp
+(within llama.cpp's own spread on that test). Measuring it needs the BF16 file (about 5 hours to download here at 4 MB/s) and the
+same loss and KL comparison with llama.cpp.
 
 ## What made it fast
 
