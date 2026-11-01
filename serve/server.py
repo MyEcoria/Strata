@@ -8849,7 +8849,7 @@ MODEL_CARD_SAMPLING = {
                   "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}},
     # DeepSeek-V4.1-Flash: temperature 1.0, top_p 1.0 for local use (thinking or not), no penalties
     "deepseek41": {"thinking": {"temperature": 1.0, "top_p": 1.0}, "instruct": {"temperature": 1.0, "top_p": 1.0}},
-    # Flint (huggingface.co/RecursiveSI/flint): temperature 1.0, top_p 0.95, top_k 20 (the GGUF carries the same three keys)
+    # Flint: temperature 1.0, top_p 0.95, top_k 20 (the model card's; the GGUF carries the same three keys)
     "flint": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20}, "instruct": {"temperature": 1.0, "top_p": 0.95, "top_k": 20}},
 }
 

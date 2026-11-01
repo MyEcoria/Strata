@@ -80,6 +80,8 @@ class EveryFileIsPinned(unittest.TestCase):
 
     def test_the_picture_reader_of_every_family(self):
         for name, fam in {**setup.FAMILIES, **setup.OWN_PATH_FAMILIES}.items():
+            if not fam.get("mmproj"):                  # a family with no pictures (Flint) has no reader to pin
+                continue
             with self.subTest(family=name):
                 self.pinned(fam["mmproj_hf"] + fam["mmproj"])
 

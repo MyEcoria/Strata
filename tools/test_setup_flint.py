@@ -37,6 +37,10 @@ class FlintFamily(unittest.TestCase):
             self.assertRegex(sha, r"^[0-9a-f]{64}$")
         self.assertRegex(self.fam["hf"], r"/unsloth/flint-GGUF/resolve/[0-9a-f]{40}/$")
 
+    def test_the_file_is_in_the_pin_table_that_lets_it_be_downloaded(self):
+        url = self.fam["hf"] + self.fam["file"].format(q="UD-Q4_K_XL")
+        self.assertEqual(setup.file_pin(url), self.fam["sha256"]["flint-UD-Q4_K_XL.gguf"])
+
     def test_the_download_url_is_the_file_of_the_pinned_revision(self):
         url = self.fam["hf"] + self.fam["file"].format(q="UD-Q4_K_XL")
         self.assertTrue(url.endswith("/resolve/" + setup.HF_REVISIONS["unsloth/flint-GGUF"] + "/flint-UD-Q4_K_XL.gguf"))
