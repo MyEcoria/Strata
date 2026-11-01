@@ -290,6 +290,32 @@ Pictures, parallel requests, full measurements and limits: [QWEN36.md](QWEN36.md
 strata launch --family qwen36 --model UD-Q4_K_XL
 ```
 
+## Flint (experimental)
+
+[Flint](https://huggingface.co/RecursiveSI/flint) is Recursive's coding model: 39.8 billion parameters, 2.5 billion active per
+token, 256 experts with 6 used, reasoning and tool calls. Strata runs
+[Unsloth's GGUF](https://huggingface.co/unsloth/flint-GGUF) on its own engine path, chosen by the file (`--family flint`). So
+far it is **Linux with an AMD card (HIP)**, one request at a time, no pictures, and only the 4-bit file was run.
+
+| Size | File | RAM setup plans for | In plain words |
+| --- | ---: | ---: | --- |
+| **UD-Q4_K_XL** | 25.1 GB | 12 GB | 4-bit (Unsloth Dynamic), the one that was tested |
+
+The engine keeps the experts that do not fit on the card in RAM, then reads them from the disk, so an NVMe disk is needed.
+
+**Measured on:** a Radeon RX 9070 (16 GB), 15 GB of RAM, NVMe, UD-Q4_K_XL.
+
+| Measure | Result |
+| --- | ---: |
+| Prompt, 6,321 tokens of code, through the server | 1,151 tokens/s |
+| Decode, 8 different sampled questions | 63.7 tokens/s with a 16,384 context (57.2 with the default 32,768) |
+
+How the experts are stored, how it was checked against llama.cpp, and what is not done: [FLINT.md](FLINT.md).
+
+```sh
+strata launch --family flint --model UD-Q4_K_XL
+```
+
 ## Adding or switching models
 
 - **In the app:** the Models page lists every model with its size and whether it fits your computer. Pick one and press the install button.

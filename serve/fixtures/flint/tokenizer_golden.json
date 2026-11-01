@@ -1,0 +1,90 @@
+{
+ "source": "llama-tokenize (llama.cpp master, Flint GGUF flint-UD-Q4_K_XL.gguf), --no-bos --no-escape, special tokens parsed",
+ "cases": [
+  {
+   "text": "The capital of France is",
+   "ids": [
+    630,
+    6963,
+    297,
+    9865,
+    332
+   ]
+  },
+  {
+   "text": "def fibonacci(n):\n    return n\n",
+   "ids": [
+    1182,
+    56797,
+    1249,
+    1080,
+    279,
+    597,
+    307,
+    198
+   ]
+  },
+  {
+   "text": "<|system|>Be brief.<|user|>Hello, world! It's 12345.<|assistant|>",
+   "ids": [
+    150002,
+    3794,
+    8675,
+    13,
+    150003,
+    9479,
+    11,
+    1571,
+    0,
+    3158,
+    220,
+    4051,
+    1362,
+    13,
+    150004
+   ]
+  },
+  {
+   "text": "<|assistant|><think>plan</think>ok<tool_call>f<arg_key>a</arg_key><arg_value>1</arg_value></tool_call><|observation|><tool_response>x</tool_response>",
+   "ids": [
+    150004,
+    150006,
+    7488,
+    150007,
+    544,
+    150010,
+    69,
+    150012,
+    64,
+    150013,
+    150014,
+    16,
+    150015,
+    150011,
+    150005,
+    150016,
+    87,
+    150017
+   ]
+  },
+  {
+   "text": "日本語 and 中文, 3.14159 ¶ naïve CamelCase",
+   "ids": [
+    86487,
+    299,
+    220,
+    50749,
+    11,
+    220,
+    18,
+    13,
+    6416,
+    2491,
+    103965,
+    82867,
+    71652,
+    6252
+   ]
+  }
+ ]
+}

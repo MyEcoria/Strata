@@ -102,6 +102,7 @@ HF_REVISIONS = {
     "agentionai/Qwen3.8-Flash-Next-Gyro-GGUF": "1ada08422e404aca51ab9df665f089f34c419c6b",           # 2026-10-13
     "unsloth/DeepSeek-V4.1-Flash-1017-GGUF": "8a6ec9cf118e785a362ea94ee123c61c70553be6",             # 2026-10-30 (adds UD-IQ1_S / UD-IQ1_M; every file pinned from the 2026-10-20 commit has the same size and SHA-256 here)
     "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF": "cb02422c900df489cea5833e8a92171224059b3c",    # 2026-10-24 (ISTA-DASLab's final 1.75 / 2.00 / 2.25 bpw sets and Engram)
+    "unsloth/flint-GGUF": "20468edfc38ab43d6914cc88b08cbecb05d0fc62",                                 # 2026-10-21 (the revision the UD-Q4_K_XL file was run at)
 }
 
 
@@ -657,6 +658,28 @@ OWN_PATH_FAMILIES = {
                # the 30 GDN layers (state_gb)
                "vision": True, "state_gb": 0.07}
 }
+# Flint (GGUF architecture flint), Recursive's coding model, Unsloth's GGUFs: an engine path of its own (src/flint, `strata`
+# switches to it from the file's architecture).  The engine reads the GGUF as it is and keeps the routed experts on three levels:
+# a per-expert cache in VRAM, a page-locked area of RAM, and the file (docs/FLINT.md).  No images, no MTP, one request at a time.
+# Only the 4-bit file was run; the other sizes of the repository are not offered until they are.  Linux, AMD (HIP) only so far.
+FLINT_FILES = {
+    "flint-UD-Q4_K_XL.gguf": (25054688704, "63c2ecc461ca545134b670c660e76fa20f47240f8d39b6510bfd21c4dd6e072f"),
+}
+OWN_PATH_FAMILIES["flint"] = {
+    "title": "Flint", "by": "Recursive; GGUFs by Unsloth", "arch": "flint",
+    "about": "a 39.8B mixture of experts with 2.5B active (256 experts, 6 used), made for coding agents, with reasoning and tool "
+             "calls; the engine keeps the experts in VRAM, then RAM, then on the disk (an NVMe disk is needed)",
+    "hf": hf("unsloth/flint-GGUF"), "file": "flint-{q}.gguf", "tag": "flint-", "name": "flint",
+    "license": "flint-preview (\"other\"): https://huggingface.co/RecursiveSI/flint",
+    # RAM: an estimate - it was run with 15 GB of RAM and a 16 GB card; the experts that do not fit in VRAM go to RAM first and
+    # are read from the disk when RAM is short
+    "models": {"UD-Q4_K_XL": {"about": "4-bit (Unsloth Dynamic), the one that was tested", "ram_gb": 12}},
+    "sha256": FLINT_FILES,
+    # the engine's KV cache per context token: 14 full-attention layers, 4 KV heads x 128, K and V in fp16 (the 35 sliding-window
+    # layers keep a ring of 1024 cells, a constant 0.3 GB)
+    "kv_bytes_per_token": 14 * 2 * 4 * 128 * 2,
+    "vision": False, "parallel": False, "mtp": 0, "cpu_pool": False,
+}
 PREVIEW_FAMILIES = OWN_PATH_FAMILIES             # the earlier name (tools and tests that import it)
 
 # DeepSeek-V4.1-Flash (GGUF architecture deepseek41), Unsloth's UD-Q8_K_XL at the revision the port was checked against: a
@@ -867,6 +890,7 @@ REPO_PINS = {
     "agentionai/Qwen3.8-Flash-Next-Gyro-GGUF": GYRO_FILES,
     "unsloth/DeepSeek-V4.1-Flash-1017-GGUF": DSV41_FILES,
     "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF": DSV41_ISTA_FILES,
+    "unsloth/flint-GGUF": FLINT_FILES,
 }
 # EXPERIMENTAL, off by default (setup asks): a control vector shipped with the repository, see its README
 ESP_VECTOR = ROOT / "data" / "experimental-speed-projection" / "Qwen3.8-Flash-Next-experimental-speed-projection.gguf"
@@ -7982,12 +8006,15 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         warn(f"{ctx // 1024}K is past {fam['title']}'s trained 262,144 positions and this engine path has no rope "
              "scaling yet: kept as you chose, but answers past 256K are untested")
     ok(f"context: {ctx} tokens")
-    vision = own_path_vision(a, fam, gpu, hip)
+    vision = own_path_vision(a, fam, gpu, hip) if fam.get("vision", True) else "none"
     ok("images: " + {"none": "off", "gpu": "on", "cpu": "on (encoder on the CPU)"}[vision])
     vram_gb = float(gpu.get("vram_gb", 0.0))
     par = getattr(a, "parallel", None)
     par_said = False
-    if par is None and not a.yes:                      # offered, with its price; Enter keeps one at a time (never forced)
+    if par is not None and not fam.get("parallel", True):
+        warn(f"--parallel: {fam['title']} serves one request at a time so far: not used")
+        par = None
+    if fam.get("parallel", True) and par is None and not a.yes:   # offered, with its price; Enter keeps one at a time (never forced)
         say()
         for line in own_path_parallel_note(None, fam, model, vram_gb, ctx):
             say("  " + line)
@@ -8037,7 +8064,7 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         download(fam["hf"] + gguf.name, gguf)
     verify_sha256(gguf, *fam["sha256"][gguf.name], own=bool(a.gguf_dir))
     ok(f"model file: {gguf}")
-    mmproj = folder / fam["mmproj"]
+    mmproj = folder / fam["mmproj"] if fam.get("mmproj") else None
     if vision != "none":                               # the image encoder: Unsloth's mmproj, pinned, size + SHA-256 checked
         if have(mmproj):
             ok(f"{mmproj.name} already downloaded")
@@ -8057,7 +8084,9 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     ok(f"tokenizer: {pack / 'tokenizer'}")
 
     step(7, "writing the start script")
-    args = ["--native", str(gguf), "--max-context", str(ctx), "--prefill", "auto", "--mtp", str(fam["mtp"])]
+    args = ["--native", str(gguf), "--max-context", str(ctx), "--prefill", "auto"]
+    if fam.get("mtp"):
+        args += ["--mtp", str(fam["mtp"])]
     if a.vram_reserve_mib is not None:             # VRAM left free for other programs: the experts take that much less
         vram = gpu.get("vram_gb", 0.0)
         if vram > 0:
@@ -8079,9 +8108,10 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         cfg["api_key"] = a.api_key
     if a.browser is not None:
         cfg["open_browser"] = a.browser
-    cfg["args"] = recommend_pool_workers(cfg["args"])   # --pool-workers: this engine path's CPU expert threads too
-    for line in pool_workers_note(cfg["args"]):
-        warn(line)
+    if fam.get("cpu_pool", True):
+        cfg["args"] = recommend_pool_workers(cfg["args"])   # --pool-workers: this engine path's CPU expert threads too
+        for line in pool_workers_note(cfg["args"]):
+            warn(line)
     cfg_path = home() / f"strata-{tag.lower()}.json"
     if vision != "none":
         old_cfg = cfg_path if cfg_path.is_file() else adopted
@@ -8115,7 +8145,7 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     say(f"  Next time:        just run {'START-HERE.bat' if WIN else './setup.sh'} (or {script.name}) - it starts right away")
     if vision != "none":
         say("  Images:           send them in the chat page, in chat.py (/image <path>) or over the API")
-    if par is None and not par_said:                   # the opt-in, said once (nothing changes)
+    if fam.get("parallel", True) and par is None and not par_said:   # the opt-in, said once (nothing changes)
         for line in own_path_parallel_note(None, fam, model, vram_gb, ctx):
             say("  " + line)
     if a.no_start:
