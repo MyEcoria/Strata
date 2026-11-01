@@ -664,6 +664,44 @@ inline std::string check_architecture_qwen35moe(const GgufFile& g) {
     return {};
 }
 
+/// Flint's guard: every key the engine reads must be present and numeric, the two layer-pattern arrays must have one
+/// entry per layer, and the shape must be the one the kernels will be written for (49 layers, 2048 wide, 32 query / 4 KV
+/// heads of 128, 256 experts with 6 used, sigmoid gating).  A different Flint-family file is refused with the key.
+inline std::string check_architecture_flint(const GgufFile& g) {
+    static const char* const keys[] = {
+        "flint.block_count", "flint.embedding_length", "flint.feed_forward_length", "flint.attention.head_count",
+        "flint.attention.head_count_kv", "flint.attention.key_length", "flint.attention.value_length",
+        "flint.attention.sliding_window", "flint.expert_count", "flint.expert_used_count",
+        "flint.expert_feed_forward_length", "flint.expert_shared_feed_forward_length",
+        "flint.leading_dense_block_count", "flint.expert_gating_func", "flint.rope.freq_base",
+        "flint.attention.layer_norm_rms_epsilon",
+    };
+    for (const char* k : keys) {
+        const MetaValue* v = g.get(k);
+        if (!v) return std::string("missing ") + k;
+        if (!v->is_num()) return std::string(k) + " is not a number";
+    }
+    auto u = [&](const char* k) { return (uint64_t) g.get(k)->u; };
+    const uint64_t nl = u("flint.block_count");
+    for (const char* k : {"flint.attention.sliding_window_pattern", "flint.attention.rope_pattern"}) {
+        const MetaValue* v = g.get(k);
+        if (!v) return std::string("missing ") + k;
+        if (v->type != MetaType::ARRAY || v->count != nl || v->items.size() != v->count)
+            return std::string(k) + " must be an array with one entry per layer (" + std::to_string(nl) + ")";
+    }
+    if (nl != 49) return "flint.block_count is " + std::to_string(nl) + ", the engine is written for 49";
+    if (u("flint.embedding_length") != 2048) return "flint.embedding_length must be 2048";
+    if (u("flint.attention.head_count") != 32 || u("flint.attention.head_count_kv") != 4)
+        return "flint attention must have 32 query heads and 4 KV heads";
+    if (u("flint.attention.key_length") != 128 || u("flint.attention.value_length") != 128)
+        return "flint head dimension must be 128";
+    if (u("flint.expert_count") != 256 || u("flint.expert_used_count") != 6)
+        return "flint must have 256 experts with 6 used per token";
+    if (u("flint.expert_gating_func") != 2) return "flint.expert_gating_func must be 2 (sigmoid)";
+    if (u("flint.leading_dense_block_count") != 2) return "flint.leading_dense_block_count must be 2";
+    return {};
+}
+
 // ---- the model's geometry from its metadata, and the architecture guard (P1.S2).  The engine runs ONE
 // architecture, qwen4exp.  Its dimensions are read from the file (llama.cpp's key names under the arch prefix)
 // and then checked against the shape the kernels are compiled for (core/geometry.hpp), so a file of another
@@ -851,6 +889,7 @@ inline std::string check_architecture(const GgufFile& f) {
     if (!arch) return "missing general.architecture";
     const ModelFamily family = model_family_from_arch(arch->s);
     if (family == ModelFamily::Qwen35Moe) return check_architecture_qwen35moe(f);
+    if (family == ModelFamily::Flint) return check_architecture_flint(f);
     core::ModelGeometry g;   // anything else is refused by name by read_geometry
     std::string err = read_geometry(f, g);
     if (err.empty()) err = geometry_unsupported(g);
