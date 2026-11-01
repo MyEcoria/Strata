@@ -58,7 +58,7 @@ Flint does not fit in 16 GB at Q4 (the experts are 23.4 GB). `strata-flint` keep
 1. **VRAM.** A cache with the same share of the experts in every MoE layer (about 95 to 150 of 256 on a 16 GB card), least
    recently used first.
 2. **Host RAM.** What the VRAM cache gives up is copied down here by asynchronous DMA, and comes back the same way. The area is
-   page-locked (`--no-pin-host` turns that off, which is slower) and sized from `MemAvailable` less 3.5 GiB (`--host-cache GiB`).
+   page-locked (`--no-pin-host` turns that off, which is slower) and sized from `MemAvailable` less 3 GiB, at most two thirds of the RAM (`--host-cache GiB`).
 3. **The file.** Experts in neither level are read with parallel `O_DIRECT` reads. The disk reached about 1.8 GB/s for these
    reads whatever their size.
 

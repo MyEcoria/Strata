@@ -886,7 +886,7 @@ struct Engine {
     // the decode step's host work: ids come back in a pinned array, the groups go out in one pinned block (one copy, no wait)
     bool pro_pending = false;
     bool host_inplace = false;      // the decode reads host-tier experts where they are and promotes the repeated ones in the background
-    int promote_after = 2;
+    int promote_after = 12;
     cudaStream_t st_pro = nullptr;  // the promotions' copies
     cudaEvent_t ev_pro = nullptr;
     int32_t* h_ids = nullptr;
@@ -1162,25 +1162,52 @@ struct Engine {
             host_bytes = (size_t) (host_gib * (double) (1ull << 30));
         } else if (FILE* f = std::fopen("/proc/meminfo", "r")) {
             char line[256];
-            unsigned long long kb = 0;
-            while (std::fgets(line, sizeof line, f))
+            unsigned long long kb = 0, tot = 0;
+            while (std::fgets(line, sizeof line, f)) {
+                (void) std::sscanf(line, "MemTotal: %llu kB", &tot);
                 if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) break;
+            }
             std::fclose(f);
-            const size_t avail = (size_t) kb * 1024, margin = (size_t) (3.5 * (double) (1ull << 30));
+            // what the system can spare less 3 GiB (the rest of the engine's pinned buffers, the server, the system), and at most
+            // two thirds of the RAM: MemAvailable counts a page cache that the pinned tier will push out
+            const size_t avail = (size_t) kb * 1024, margin = (size_t) (3.0 * (double) (1ull << 30));
             host_bytes = avail > margin ? avail - margin : 0;
+            if (tot > 0) host_bytes = std::min<size_t>(host_bytes, (size_t) ((double) tot * 1024.0 * 0.66));
         }
         size_t host_used = 0;
         int min_h = 1 << 30, max_h = 0;
         if (host_bytes > 0) {
-            const size_t per_h = host_bytes / (size_t) n_moe;
+            // the same share of the budget for every layer, but a layer never takes more than what its VRAM cache leaves out
+            // (NE - S): what the capped layers leave over goes to the others, so the whole budget is used when it is needed
             size_t total = 0;
             std::vector<int> sh(M.layers.size(), 0);
-            for (size_t l = 0; l < M.layers.size(); ++l) {
-                const Layer& L = M.layers[l];
-                if (L.dense) continue;
-                sh[l] = (int) std::min<size_t>((size_t) M.NE - (size_t) L.S, per_h / L.stride);
-                total += (size_t) sh[l] * L.stride;
+            std::vector<size_t> open_layers;
+            for (size_t l = 0; l < M.layers.size(); ++l)
+                if (!M.layers[l].dense) open_layers.push_back(l);
+            size_t left = host_bytes;
+            while (!open_layers.empty()) {
+                const size_t share = left / open_layers.size();
+                std::vector<size_t> still;
+                bool capped_any = false;
+                for (size_t l : open_layers) {
+                    const Layer& L = M.layers[l];
+                    const size_t room = (size_t) M.NE - (size_t) L.S;
+                    if (room * L.stride <= share) {   // this layer takes all it can use
+                        sh[l] = (int) room;
+                        left -= room * L.stride;
+                        capped_any = true;
+                    } else {
+                        still.push_back(l);
+                    }
+                }
+                if (!capped_any) {   // nobody is capped by an equal share: split what is left
+                    for (size_t l : still) sh[l] = (int) (share / M.layers[l].stride);
+                    break;
+                }
+                open_layers = still;
             }
+            for (size_t l = 0; l < M.layers.size(); ++l)
+                if (!M.layers[l].dense) total += (size_t) sh[l] * M.layers[l].stride;
             if (total > 0) {
                 uint8_t* base = (uint8_t*) mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
                 if (base == MAP_FAILED) {
@@ -1276,9 +1303,15 @@ struct Engine {
             }
         constexpr size_t kSlack = (8u << 20) + 3 * 4096;
         uint8_t *bg = nullptr, *bu = nullptr, *bd = nullptr;
-        CK(cudaHostAlloc((void**) &bg, gmax + kSlack, cudaHostAllocDefault));
-        CK(cudaHostAlloc((void**) &bu, gmax + kSlack, cudaHostAllocDefault));
-        CK(cudaHostAlloc((void**) &bd, dmax + kSlack, cudaHostAllocDefault));
+        if (cudaHostAlloc((void**) &bg, gmax + kSlack, cudaHostAllocDefault) != cudaSuccess ||
+            cudaHostAlloc((void**) &bu, gmax + kSlack, cudaHostAllocDefault) != cudaSuccess ||
+            cudaHostAlloc((void**) &bd, dmax + kSlack, cudaHostAllocDefault) != cudaSuccess) {
+            (void) cudaGetLastError();
+            if (bg) cudaFreeHost(bg);
+            if (bu) cudaFreeHost(bu);
+            std::fprintf(stderr, "strata-flint: no memory for the start-up fill (the host tier is large for this machine: --host-cache GiB takes less); the caches fill from use\n");
+            return;
+        }
         size_t bytes = 0;
         for (size_t l = 0; l < M.layers.size(); ++l) {
             const Layer& L = M.layers[l];
@@ -2812,7 +2845,7 @@ int strata::flint::run(int argc, char** argv) {
     int n_new = 16, ctx = 4096, bench = 0;
     double expert_vram = -1;
     bool trace = false, buffered = false, prof = false;
-    int chunk = 4096;
+    int chunk = 2048;
     double host_gib = -1;
     bool pin_host = true, prof_predict = false;
     int bench_floor = 0;
@@ -2831,7 +2864,7 @@ int strata::flint::run(int argc, char** argv) {
         if (a == "--model" || a == "--native") path = next();
         else if (a == "--serve") serve_mode = true;
         else if (a == "--ctx") ctx = std::atoi(next());
-        else if (a == "--prefill") { const std::string v = next(); chunk = v == "auto" ? 4096 : std::atoi(v.c_str()); }
+        else if (a == "--prefill") { const std::string v = next(); chunk = v == "auto" ? 2048 : std::atoi(v.c_str()); }
         else if (a == "--gpu") (void) next();   // applied by strata before the switch (HIP_VISIBLE_DEVICES)
         else if (a == "--tokens") prompt = parse_ids(next());
         else if (a == "--n" || a == "--max-new") n_new = std::atoi(next());
@@ -2857,9 +2890,9 @@ int strata::flint::run(int argc, char** argv) {
                         "  --n N                 tokens to generate (greedy), default 16\n"
                         "  --force IDS           teacher forcing: feed these ids instead of the greedy ones\n"
                         "  --max-context N       cells of the KV cache of the full-attention layers (default: prompt + new tokens)\n"
-                        "  --chunk N             prompt tokens per forward, 8..4096 (default 4096; 512 without the long-prompt path; 2048 leaves ~7% more decode speed to the expert cache)\n"
+                        "  --chunk N             prompt tokens per forward, 8..4096 (default 2048; 512 without the long-prompt path; every 1000 tokens of chunk takes ~0.3 GiB from the expert cache in VRAM)\n"
                         "  --expert-vram GiB     VRAM for the expert cache (default: what is free after a warmup, less 0.6 GiB)\n"
-                        "  --host-cache GiB      host RAM for the expert tier below it (default: MemAvailable less 3.5 GiB)\n"
+                        "  --host-cache GiB      host RAM for the expert tier below it (default: MemAvailable less 3 GiB, at most two thirds of the RAM)\n"
                         "  --no-pin-host         do not page-lock the host tier (slower: its swaps are staged and synchronous)\n"
                         "  --prefetch N          lookahead: bring N guessed experts of the next layer in early (default 0, no gain measured)\n"
                         "  --buffered            read the file through the page cache instead of O_DIRECT (slower)\n"
@@ -2950,10 +2983,50 @@ int strata::flint::run(int argc, char** argv) {
         const size_t budget = expert_vram >= 0 ? (size_t) (expert_vram * (double) (1 << 30)) : (fr > reserve ? fr - reserve : 0);
         E.place_experts(budget);
     }
+    auto print_prof = [&]() {
+    if (prof && E.n_fwd > 0) {
+        const double f = (double) E.n_fwd;
+        std::fprintf(stderr, "prof: %ld decode steps, %.1f ms each; per step streamed-layer waits: ids D2H+sync %.1f ms, "
+                     "reads %.1f ms, upload+sync %.1f ms (%.1f streamed layers/step)\n", E.n_fwd, E.t_fwd / f, E.t_sync / f,
+                     E.t_read / f, E.t_up / f, (double) E.n_calls / f);
+        std::fprintf(stderr, "prof: per decode step: %.2f ms reading the file (of the %.2f ms in load_experts), %.2f ms waiting for the GPU at the router's sync\n",
+                     E.t_ssdread / (double) E.n_fwd, E.t_read / (double) E.n_fwd, E.t_sync / (double) E.n_fwd);
+        std::fprintf(stderr, "prof: VRAM misses: %ld from the host tier, %ld read from the SSD; %ld experts demoted to the host tier; %ld loaded ahead by the lookahead\n",
+                     E.host_hits_, E.ssd_reads_, E.demoted_, E.pf_loaded_);
+        if (E.pf_filled_v + E.pf_filled_h > 0)
+            std::fprintf(stderr, "prof: the prompt filled %ld VRAM-cache and %ld host-tier slots\n", E.pf_filled_v, E.pf_filled_h);
+        if (E.total_ > 0)
+            std::fprintf(stderr, "prof: expert cache hit rate over the whole run (prompt included): %.1f%% of %ld choices\n",
+                         100.0 * (double) E.hits_ / (double) E.total_, E.total_);
+        if (E.lru_total > 0) {
+            std::fprintf(stderr, "prof: simulated per-layer LRU hit rate on the streamed layers (decode):");
+            for (int c = 0; c < 6; ++c)
+                std::fprintf(stderr, " %d slots %.0f%%", Engine::kLruCaps[c], 100.0 * (double) E.lru_hits[c] / (double) E.lru_total);
+            std::fprintf(stderr, "\n");
+            // a static choice: the N most-used experts of each streamed layer (counted over this very run: an upper bound)
+            for (int N_ : {24, 48, 96, 160}) {
+                long hit = 0, tot = 0;
+                for (size_t l = 0; l < m.layers.size(); ++l) {
+                    if (m.layers[l].dense || E.resident[l]) continue;
+                    std::vector<long> u(E.layer_use.begin() + (long) (l * (size_t) m.NE), E.layer_use.begin() + (long) ((l + 1) * (size_t) m.NE));
+                    std::sort(u.begin(), u.end(), std::greater<long>());
+                    for (int i = 0; i < (int) u.size(); ++i) (i < N_ ? hit : tot) += u[(size_t) i];
+                    tot += 0;
+                }
+                long all = 0;
+                for (long v : E.layer_use) all += v;
+                std::fprintf(stderr, "prof: static top-%d experts per streamed layer would cover %.0f%% of the choices\n", N_,
+                             100.0 * (double) hit / (double) std::max(all, 1L));
+            }
+        }
+    }
+    };
     if (serve_mode) {
         std::signal(SIGPIPE, SIG_IGN);
         Server sv(E, m);
-        return sv.run();
+        const int rc = sv.run();
+        print_prof();
+        return rc;
     }
     if (bench_floor > 0) {   // the time of a decode step with every expert a hit and no host work: eager, then as a graph
         const int n = bench_floor;
@@ -3057,42 +3130,7 @@ int strata::flint::run(int argc, char** argv) {
         }
         if (fdump) std::fwrite(lg.data(), 4, lg.size(), fdump);
     }
-    if (prof && E.n_fwd > 0) {
-        const double f = (double) E.n_fwd;
-        std::fprintf(stderr, "prof: %ld decode steps, %.1f ms each; per step streamed-layer waits: ids D2H+sync %.1f ms, "
-                     "reads %.1f ms, upload+sync %.1f ms (%.1f streamed layers/step)\n", E.n_fwd, E.t_fwd / f, E.t_sync / f,
-                     E.t_read / f, E.t_up / f, (double) E.n_calls / f);
-        std::fprintf(stderr, "prof: per decode step: %.2f ms reading the file (of the %.2f ms in load_experts), %.2f ms waiting for the GPU at the router's sync\n",
-                     E.t_ssdread / (double) E.n_fwd, E.t_read / (double) E.n_fwd, E.t_sync / (double) E.n_fwd);
-        std::fprintf(stderr, "prof: VRAM misses: %ld from the host tier, %ld read from the SSD; %ld experts demoted to the host tier; %ld loaded ahead by the lookahead\n",
-                     E.host_hits_, E.ssd_reads_, E.demoted_, E.pf_loaded_);
-        if (E.pf_filled_v + E.pf_filled_h > 0)
-            std::fprintf(stderr, "prof: the prompt filled %ld VRAM-cache and %ld host-tier slots\n", E.pf_filled_v, E.pf_filled_h);
-        if (E.total_ > 0)
-            std::fprintf(stderr, "prof: expert cache hit rate over the whole run (prompt included): %.1f%% of %ld choices\n",
-                         100.0 * (double) E.hits_ / (double) E.total_, E.total_);
-        if (E.lru_total > 0) {
-            std::fprintf(stderr, "prof: simulated per-layer LRU hit rate on the streamed layers (decode):");
-            for (int c = 0; c < 6; ++c)
-                std::fprintf(stderr, " %d slots %.0f%%", Engine::kLruCaps[c], 100.0 * (double) E.lru_hits[c] / (double) E.lru_total);
-            std::fprintf(stderr, "\n");
-            // a static choice: the N most-used experts of each streamed layer (counted over this very run: an upper bound)
-            for (int N_ : {24, 48, 96, 160}) {
-                long hit = 0, tot = 0;
-                for (size_t l = 0; l < m.layers.size(); ++l) {
-                    if (m.layers[l].dense || E.resident[l]) continue;
-                    std::vector<long> u(E.layer_use.begin() + (long) (l * (size_t) m.NE), E.layer_use.begin() + (long) ((l + 1) * (size_t) m.NE));
-                    std::sort(u.begin(), u.end(), std::greater<long>());
-                    for (int i = 0; i < (int) u.size(); ++i) (i < N_ ? hit : tot) += u[(size_t) i];
-                    tot += 0;
-                }
-                long all = 0;
-                for (long v : E.layer_use) all += v;
-                std::fprintf(stderr, "prof: static top-%d experts per streamed layer would cover %.0f%% of the choices\n", N_,
-                             100.0 * (double) hit / (double) std::max(all, 1L));
-            }
-        }
-    }
+    print_prof();
     if (prof_predict && E.pr_total > 0)
         std::fprintf(stderr, "predict: next layer's experts guessed from this layer's residual: of the experts really chosen, %.0f%% are in the guess's top 6, %.0f%% in its top 12, %.0f%% in its top 16; of the VRAM misses, %.0f%% in the top 12 and %.0f%% in the top 16 (%ld misses)\n",
                      100.0 * (double) E.pr_in6 / (double) E.pr_total, 100.0 * (double) E.pr_in12 / (double) E.pr_total,
