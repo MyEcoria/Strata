@@ -113,6 +113,33 @@ its code; fusing the attention's residual add, the norm and the quantizer into o
 **What limits the prompt.** Every chunk streams all the experts through the card; the compute alone is 1,729 tokens/s at 2048.
 With every expert in memory, a prompt of up to a thousand tokens takes about a second.
 
+## What made it fast
+
+Each step below is what was changed and what it did on the test machine (RX 9070, 15 GB RAM). The numbers are tokens per second on
+the same kind of test as "Measured" unless said otherwise; the logits did not change in any step (mean KL 0 on a 40-step forced run).
+
+| Step | Change | Effect |
+| --- | --- | --- |
+| Prompt, first version | 64-token path, one expert at a time | 94 tokens/s on 6,400 tokens |
+| Prompt on the matrix cores | FP16 GEMMs for the dense projections, batched attention per KV head, experts through llama.cpp's int8 MMQ in groups of 16, a loader thread and a file-reader thread ahead of the GPU, caches filled at start | 1,164 tokens/s |
+| Router | the top-6 choice ran in one thread of the block (11 ms of every decode step); six block-wide argmax rounds | decode step 46 to 35 ms |
+| Lean decode step | ids back in a pinned array, the groups sent in one pinned block with one copy, the kernel queued at once; the GPU reads host-tier experts in place (mapped page-locked memory) instead of copying them to VRAM first | 27 to 34 |
+| Host tier | the whole RAM budget is used (a layer never takes more than the experts its VRAM cache leaves out, the rest goes to the other layers); an expert is swapped into the VRAM cache after 12 uses outside it, through a VRAM scratch buffer, so the tiers keep what they hold | 34 to 49 (with the tier at 9.9 GiB) |
+| Chunk of 2048 | the buffers of a 4096 chunk take 0.6 GiB from the expert cache | 43 to 49; the prompt stays above 1,000 tokens/s |
+| Embedding table in RAM | one row is read per token; its 0.3 GiB of VRAM goes to the expert cache | 49 to 50 |
+| Short prompts in place | prompts of 9 to 64 tokens used the old swapping path, which pushed about 1,200 experts a request back to the file | 53 to 64 |
+| Fused kernel | the attention's residual add, the FFN's norm and the q8_1 quantizer in one launch | +0.4 |
+
+Rules that came out of it: every 0.3 GiB of VRAM taken from the expert cache costs about 3 tokens/s; every expert that has to come
+from the file costs 1.4 ms (the disk gives 1.7 GB/s whatever the size of the read), against 0.075 ms for one read in place from
+RAM; and the `strata` program contains the engine, so it must be rebuilt together with `strata-flint` to measure a change.
+
+Tools for the next person: `--prof` (also in serve mode) prints where a step's time goes; `--bench-floor N` the GPU time of a step with
+every expert a hit (10.7 ms); `STRATA_FLINT_TRACE=file` records the experts chosen in every layer of every decode step, to simulate
+cache policies offline; `STRATA_FLINT_PROMOTE_AFTER`, `STRATA_FLINT_NO_INPLACE`, `STRATA_FLINT_NO_FUSE`, `STRATA_FLINT_EMBD_VRAM`
+and `STRATA_FLINT_NO_WARM` turn single changes off or on. Measure decode on sampled, varied text: greedy decoding of a repeating text
+reuses the same experts and reads 60 tokens/s on a machine that does 49 on real answers.
+
 ## Checked against llama.cpp
 
 The reference is llama.cpp's own Flint graph (CPU backend), same GGUF, same ids. `tools/flint/compare.py` compares the logits;
