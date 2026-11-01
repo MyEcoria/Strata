@@ -48,6 +48,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <condition_variable>
+#include <map>
 #include <csignal>
 #include <iostream>
 #include <cstring>
@@ -269,33 +270,55 @@ __global__ void k_att_merge(const float* pacc, const float* pm, const float* pl,
     out[(size_t) th * kHD + tid] = num / denom;
 }
 
-/// The router: p = sigmoid(logit) for each of the n_expert experts, the top-k by p (ties: the lower index), their
-/// weights p / max(sum, 6.1035156e-5) * scale.  One block per token, one thread does the (tiny) selection.
+/// The router: p = sigmoid(logit) for each of the n_expert experts (at most 512), the top-k by p (ties: the lower index), their
+/// weights p / max(sum, 6.1035156e-5) * scale.  One block of 256 threads per token: k rounds of an argmax over the block.
 __global__ void k_route(const float* logits, int n_expert, int k, float scale, int32_t* ids, float* wts) {
-    __shared__ float p[512];
+    __shared__ float p[512], rv[256];
+    __shared__ int ri[256];
+    __shared__ int sel[kMaxK];
+    __shared__ float selw[kMaxK];
+    const int tid = threadIdx.x, bd = blockDim.x;
     const float* lr = logits + (size_t) blockIdx.x * n_expert;
-    for (int i = threadIdx.x; i < n_expert; i += blockDim.x) p[i] = 1.0f / (1.0f + expf(-lr[i]));
+    for (int i = tid; i < n_expert; i += bd) p[i] = 1.0f / (1.0f + expf(-lr[i]));
     __syncthreads();
-    if (threadIdx.x != 0) return;
-    float sel_w[kMaxK];
-    float sum = 0.f;
     for (int j = 0; j < k; ++j) {
-        int best = -1;
         float bv = -INFINITY;
-        for (int i = 0; i < n_expert; ++i) {
-            bool taken = false;
-            for (int q = 0; q < j; ++q) taken |= ids[(size_t) blockIdx.x * k + q] == i;
-            if (!taken && p[i] > bv) {
+        int bi = -1;
+        for (int i = tid; i < n_expert; i += bd)
+            if (p[i] > bv) {   // (strictly greater: of equal values the lowest index stays)
                 bv = p[i];
-                best = i;
+                bi = i;
             }
+        rv[tid] = bv;
+        ri[tid] = bi;
+        __syncthreads();
+        for (int s = bd / 2; s > 0; s >>= 1) {
+            if (tid < s) {
+                const float ov = rv[tid + s];
+                const int oi = ri[tid + s];
+                if (ov > rv[tid] || (ov == rv[tid] && oi >= 0 && (ri[tid] < 0 || oi < ri[tid]))) {
+                    rv[tid] = ov;
+                    ri[tid] = oi;
+                }
+            }
+            __syncthreads();
         }
-        ids[(size_t) blockIdx.x * k + j] = best;
-        sel_w[j] = bv;
-        sum += bv;
+        if (tid == 0) {
+            sel[j] = ri[0];
+            selw[j] = rv[0];
+            if (ri[0] >= 0) p[ri[0]] = -INFINITY;
+        }
+        __syncthreads();
     }
-    const float denom = fmaxf(sum, 6.103515625e-5f);
-    for (int j = 0; j < k; ++j) wts[(size_t) blockIdx.x * k + j] = sel_w[j] / denom * scale;
+    if (tid == 0) {
+        float sum = 0.f;
+        for (int j = 0; j < k; ++j) sum += selw[j];
+        const float denom = fmaxf(sum, 6.103515625e-5f);
+        for (int j = 0; j < k; ++j) {
+            ids[(size_t) blockIdx.x * k + j] = sel[j];
+            wts[(size_t) blockIdx.x * k + j] = selw[j] / denom * scale;
+        }
+    }
 }
 
 /// Groups the T * k (token, expert) entries by expert for native_expert_grouped, resident layer: expert x's blob at
@@ -398,6 +421,34 @@ __global__ void k_route_scatter(const int32_t* ids, int n_ent, int K_, int32_t* 
     src[r] = e / K_;
     inv[e] = r;
 }
+/// Benchmark only (--bench-floor): k_group with expert x's blob in slot x % S of the layer's VRAM cache, as if every expert were a
+/// hit: the time of a token with no host work at all.
+__global__ void k_group_mod(const int32_t* ids, int n_ent, int K_, int n_expert, const uint8_t* blobs, unsigned long long blob, int S,
+                            unsigned long long* grp_ptr, int32_t* grp_start, int32_t* n_groups, int32_t* ent_dst, int32_t* ent_tok) {
+    __shared__ int cnt[512], off[512];
+    for (int x = threadIdx.x; x < n_expert; x += blockDim.x) cnt[x] = 0;
+    __syncthreads();
+    for (int e = threadIdx.x; e < n_ent; e += blockDim.x) atomicAdd(&cnt[ids[e]], 1);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int g = 0, pos = 0;
+        for (int x = 0; x < n_expert; ++x) {
+            off[x] = pos;
+            if (cnt[x] == 0) continue;
+            grp_ptr[g] = (unsigned long long) (blobs + (size_t) (x % S) * blob);
+            grp_start[g] = pos;
+            pos += cnt[x];
+            ++g;
+        }
+        grp_start[g] = pos;
+        *n_groups = g;
+        for (int e = 0; e < n_ent; ++e) {
+            const int p = off[ids[e]]++;
+            ent_dst[p] = e;
+            ent_tok[p] = e / K_;
+        }
+    }
+}
 /// x[t] += shared[t] + sum_j wts[t * K + j] * parts[inv[t * K + j]] (the prompt's MoE block: the experts' rows are in sorted order).
 __global__ void k_combine_sorted(float* x, const float* shared, const float* parts, const int32_t* inv, const float* wts,
                                  const float* rsc, int K_, int n) {
@@ -476,6 +527,7 @@ struct Layer {
     // the host-RAM tier below the VRAM cache: experts the VRAM cache gave up, kept as native blobs (an expert is in at
     // most one tier)
     uint8_t* hblob = nullptr;
+    uint8_t* hdev = nullptr;   // the same memory as the GPU addresses it (mapped host memory): the experts are read in place
     int Sh = 0;
     mutable std::vector<int> hexp_slot, hslot_exp;
     mutable std::vector<long> hslot_use;
@@ -829,6 +881,32 @@ struct Engine {
     std::thread pf_th;
     bool finite_check = std::getenv("STRATA_FLINT_CHECK_FINITE") != nullptr;
     int* d_cnt = nullptr;
+    bool fake_hit = false, skip_tok_copy = false;   // --bench-floor
+    // --bench-floor: where the GPU time of a decode step goes, by section (events between the sections)
+    bool secprof = false;
+    std::vector<std::pair<const char*, cudaEvent_t>> marks;
+    std::map<std::string, double> sec_ms;
+    std::vector<cudaEvent_t> mark_pool;
+    void mark(const char* name) {
+        if (!secprof) return;
+        if (marks.size() >= mark_pool.size()) {
+            cudaEvent_t e;
+            CK(cudaEventCreate(&e));
+            mark_pool.push_back(e);
+        }
+        CK(cudaEventRecord(mark_pool[marks.size()], st));
+        marks.emplace_back(name, mark_pool[marks.size()]);
+    }
+    void marks_collect() {
+        if (!secprof || marks.empty()) return;
+        CK(cudaStreamSynchronize(st));
+        for (size_t i = 1; i < marks.size(); ++i) {
+            float ms = 0;
+            CK(cudaEventElapsedTime(&ms, marks[i - 1].second, marks[i].second));
+            sec_ms[marks[i].first] += ms;
+        }
+        marks.clear();
+    }
     bool pf_dry = std::getenv("STRATA_FLINT_PF_DRY") != nullptr;   // timing only: no expert is loaded, the products run on whatever the buffers hold                  // the warmup: the kernels run on whatever the buffers hold, no expert is loaded
     long clock_ = 0;
     bool pin_host = true;           // --no-pin-host: do not page-lock the host tier (then the swaps are staged and synchronous)
@@ -838,6 +916,7 @@ struct Engine {
     cudaStream_t st2 = nullptr;     // copies of the lookahead, beside the compute on st
     cudaStream_t cs = nullptr;      // the stream the expert copies of the moment go on (st, or st2 during the lookahead)
     cudaEvent_t ev = nullptr;
+    bool host_direct = false;       // the GPU reads the experts of the host tier in place
     bool host_pinned = false;       // the host tier is page-locked: swaps are asynchronous DMA, no staging, no memcpy
     int prefetch_k = 0;             // experts of the next layer, from the guess, to bring into the VRAM cache early
     // --prof-predict: how well the next layer's experts can be guessed from this layer's residual (decode only)
@@ -861,7 +940,7 @@ struct Engine {
     bool buffered = false;
     // --prof: where the decode time goes, and how well an LRU of experts per layer would do (simulated)
     bool prof = false;
-    double t_sync = 0, t_read = 0, t_up = 0, t_fwd = 0;
+    double t_sync = 0, t_read = 0, t_up = 0, t_fwd = 0, t_ssdread = 0;
     long n_calls = 0, n_fwd = 0, hits_ = 0, total_ = 0;
     std::vector<std::vector<int>> recency;   // per layer, most recent first
     long lru_hits[6] = {0, 0, 0, 0, 0, 0}, lru_total = 0;
@@ -1108,9 +1187,19 @@ struct Engine {
                     host_used = total;
                     if (pin_host) {   // page-locked: the copies to the GPU skip the driver's staging buffer
                         const auto tr = Clock::now();
-                        const cudaError_t e = cudaHostRegister(base, total, cudaHostRegisterPortable);
+                        const cudaError_t e = cudaHostRegister(base, total, cudaHostRegisterPortable | cudaHostRegisterMapped);
                         if (e == cudaSuccess) {
                             host_pinned = true;
+                            void* dptr = nullptr;
+                            if (cudaHostGetDevicePointer(&dptr, base, 0) == cudaSuccess && dptr) {
+                                for (size_t l2 = 0; l2 < M.layers.size(); ++l2) {
+                                    const Layer& L2 = M.layers[l2];
+                                    if (!L2.dense && L2.hblob) const_cast<Layer&>(L2).hdev = (uint8_t*) dptr + (L2.hblob - base);
+                                }
+                                host_direct = std::getenv("STRATA_FLINT_DIRECT") != nullptr;   // an experiment: measured slower than the LRU with swaps (40 against 35 ms per token)
+                            } else {
+                                (void) cudaGetLastError();
+                            }
                             std::fprintf(stderr, "strata-flint: host tier page-locked (%.1f s)\n", ms_since(tr) / 1000.0);
                         } else {
                             (void) cudaGetLastError();
@@ -1246,6 +1335,21 @@ struct Engine {
         }
         k_gemv_f32<<<dim3(rows8((int) M.NE), T), kThreads, 0, st>>>(L.router, h, logits_r, N, (int) M.NE);
         k_route<<<T, 256, 0, st>>>(logits_r, (int) M.NE, Kp, M.w_scale, ids, ewts);
+        if (fake_hit && T == 1 && L.S > 0) {   // --bench-floor: every expert a hit, no host work
+            mark("  router+route");
+            k_group_mod<<<1, 256, 0, st>>>(ids, Kp, Kp, (int) M.NE, L.cblob, L.stride, L.S, grp_ptr, grp_start, n_groups, ent_dst, ent_tok);
+            mark("  group");
+            K::native_expert_grouped(L.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, std::min<int64_t>(Kp, M.NE), Kp, xq, escr, eparts, st);
+            mark("  experts (native grouped)");
+            mm(L.sh_gate, xq, sg, T);
+            mm(L.sh_up, xq, su, T);
+            swiglu_q(sg, su, q8, (int) M.FFS, T);
+            mm(L.sh_down, q8, sy, T);
+            mark("  shared expert");
+            k_combine<<<T, kThreads, 0, st>>>(x, sy, eparts, ewts, Kp, N);
+            mark("  combine");
+            return;
+        }
         if ((prof_predict || prefetch_k > 0) && T == 1 && li + 1 < M.layers.size() && !M.layers[li + 1].dense) {
             // the guess for the next layer: its router on this layer's residual (after the attention, before the MoE)
             const Layer& Ln = M.layers[li + 1];
@@ -1306,7 +1410,11 @@ struct Engine {
                     ++ssd_reads_;
                 }
             }
-            if (!ssd.empty()) read_parts(L, ssd.data(), (int) ssd.size());
+            if (!ssd.empty()) {
+                const auto ts0 = Clock::now();
+                read_parts(L, ssd.data(), (int) ssd.size());
+                t_ssdread += ms_since(ts0);
+            }
             // the experts that come from the host tier first: a demotion made for one read from the file could otherwise
             // give away the host slot of an expert of this batch that is still to be promoted
             std::vector<int> order;
@@ -1406,6 +1514,83 @@ struct Engine {
     /// chunk are run in rounds of at most S (the cache's slots): the cached ones first, then the others, each round's
     /// missing experts read from the file into the least recently used slots.  A decode step or a chunk of 8 tokens is
     /// one round.  Writes the unweighted expert outputs to eparts (row = token * k + j).
+    /// A decode step (or a few tokens) with the host tier read in place: an expert is read by the GPU from the VRAM cache or from
+    /// the mapped host memory, wherever it is; one that is on neither is read from the file into a host slot first.  Nothing is
+    /// copied to the VRAM and nothing is given back: the experts stay where they were put.
+    void moe_direct(const Layer& L, size_t li, int T, const std::vector<std::vector<int32_t>>& entries,
+                    const std::vector<int32_t>& uniq) {
+        const Model& M = *m;
+        const int Kp = (int) M.TK;
+        ++clock_;
+        std::vector<int32_t> ssd;
+        for (int32_t xk : uniq) {
+            if (L.exp_slot[(size_t) xk] >= 0) L.slot_use[(size_t) L.exp_slot[(size_t) xk]] = clock_;
+            else if (L.hexp_slot[(size_t) xk] >= 0) L.hslot_use[(size_t) L.hexp_slot[(size_t) xk]] = clock_;
+            else ssd.push_back(xk);
+        }
+        if (!ssd.empty()) {
+            const auto tp1 = Clock::now();
+            for (size_t b0 = 0; b0 < ssd.size(); b0 += (size_t) pin_slots) {
+                const int n = (int) std::min<size_t>((size_t) pin_slots, ssd.size() - b0);
+                read_parts(L, ssd.data() + b0, n);
+                for (int k = 0; k < n; ++k) {
+                    int hs = -1;   // an empty host slot, else the least recently used one that this call does not use
+                    long best = 0;
+                    for (int c = 0; c < L.Sh; ++c) {
+                        if (L.hslot_use[(size_t) c] == clock_) continue;
+                        if (hs < 0 || L.hslot_use[(size_t) c] < best) {
+                            hs = c;
+                            best = L.hslot_use[(size_t) c];
+                            if (L.hslot_exp[(size_t) c] < 0) break;
+                        }
+                    }
+                    if (hs < 0) {
+                        std::fprintf(stderr, "strata-flint: no free host slot (Sh=%d)\n", L.Sh);
+                        std::exit(1);
+                    }
+                    const int32_t xk = ssd[b0 + (size_t) k];
+                    if (L.hslot_exp[(size_t) hs] >= 0) L.hexp_slot[(size_t) L.hslot_exp[(size_t) hs]] = -1;
+                    uint8_t* dst = L.hblob + (size_t) hs * L.stride;
+                    std::memcpy(dst, part_ptr(L, xk, k, 0), L.src_gsz);
+                    std::memcpy(dst + L.L.up_off, part_ptr(L, xk, k, 1), L.src_gsz);
+                    std::memcpy(dst + L.L.down_off, part_ptr(L, xk, k, 2), L.src_dsz);
+                    L.hslot_exp[(size_t) hs] = xk;
+                    L.hexp_slot[(size_t) xk] = hs;
+                    L.hslot_use[(size_t) hs] = clock_;
+                }
+            }
+            if (prof) t_read += ms_since(tp1);
+        }
+        std::vector<unsigned long long> gp;
+        std::vector<int32_t> gs, ed, et;
+        for (int32_t xk : uniq) {
+            const unsigned long long blob = L.exp_slot[(size_t) xk] >= 0
+                                                ? (unsigned long long) (L.cblob + (size_t) L.exp_slot[(size_t) xk] * L.stride)
+                                                : (unsigned long long) (L.hdev + (size_t) L.hexp_slot[(size_t) xk] * L.stride);
+            const std::vector<int32_t>& en = entries[(size_t) xk];
+            for (size_t e0 = 0; e0 < en.size(); e0 += kGroupEntries) {
+                gp.push_back(blob);
+                gs.push_back((int32_t) ed.size());
+                for (size_t e1 = e0; e1 < std::min(en.size(), e0 + kGroupEntries); ++e1) {
+                    ed.push_back(en[e1]);
+                    et.push_back(en[e1] / Kp);
+                }
+            }
+        }
+        gs.push_back((int32_t) ed.size());
+        const int32_t ng = (int32_t) gp.size();
+        CK(cudaMemcpyAsync(grp_ptr, gp.data(), gp.size() * 8, cudaMemcpyHostToDevice, st));
+        CK(cudaMemcpyAsync(grp_start, gs.data(), gs.size() * 4, cudaMemcpyHostToDevice, st));
+        CK(cudaMemcpyAsync(n_groups, &ng, 4, cudaMemcpyHostToDevice, st));
+        CK(cudaMemcpyAsync(ent_dst, ed.data(), ed.size() * 4, cudaMemcpyHostToDevice, st));
+        CK(cudaMemcpyAsync(ent_tok, et.data(), et.size() * 4, cudaMemcpyHostToDevice, st));
+        CK(cudaStreamSynchronize(st));   // the host vectors are free again
+        K::native_expert_grouped(L.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, (int64_t) gp.size(), (int64_t) ed.size(), xq, escr,
+                                 eparts, st);
+        (void) li;
+        (void) T;
+    }
+
     void moe_cached(const Layer& L, size_t li, int T) {
         const Model& M = *m;
         const int Kp = (int) M.TK, n_ent = T * Kp;
@@ -1433,6 +1618,16 @@ struct Engine {
             ++n_calls;
             for (int32_t xk : hits) hits_ += (long) entries[(size_t) xk].size();
             total_ += n_ent;
+        }
+        if (host_direct && !tmp && L.Sh >= (int) uniq.size() && T <= 64) {
+            if (prof) {   // (hits are the VRAM cache's; the rest are read in place from the host tier or from the file)
+                for (int32_t xk : misses) {
+                    if (L.hexp_slot[(size_t) xk] >= 0) ++host_hits_;
+                    else ++ssd_reads_;
+                }
+            }
+            moe_direct(L, li, T, entries, uniq);
+            return;
         }
         if ((prof_predict || prefetch_k > 0) && T == 1) {
             if (prof_predict && guess_layer == li && !guess_next.empty()) {
@@ -2080,15 +2275,19 @@ struct Engine {
         const Model& M = *m;
         const auto tf0 = Clock::now();
         const int N = (int) M.N;
-        CK(cudaMemcpyAsync(tok, toks, (size_t) T * 4, cudaMemcpyHostToDevice, st));
+        if (!skip_tok_copy) CK(cudaMemcpyAsync(tok, toks, (size_t) T * 4, cudaMemcpyHostToDevice, st));
+        mark("start");
         k_embed<<<T, kThreads, 0, st>>>(tok, M.embd, M.embd_row, M.embd_type, x, N);
+        mark("embed");
         const bool pf = pf2 && T > kPf2Min;
         if (pf) pf_begin();
         for (size_t l = 0; l < M.layers.size(); ++l) {
             const Layer& L = M.layers[l];
             k_rms<<<T, kThreads, 0, st>>>(x, L.attn_norm, h, N, M.eps);
+            mark("rms_attn");
             if (pf) attention_pf(L, l, T, p0);
             else attention(L, l, T, p0);
+            mark("attention");
             if (pf && finite_check) {
                 if (!d_cnt) CK(cudaMalloc(&d_cnt, 4));
                 CK(cudaMemsetAsync(d_cnt, 0, 4, st));
@@ -2100,12 +2299,15 @@ struct Engine {
                                      L.swa ? "window" : "full", hc);
             }
             k_rms<<<T, kThreads, 0, st>>>(x, L.ffn_norm, h, N, M.eps);
+            mark("rms_ffn");
             if (pf) {
                 ffn_pf(L, l, T);
             } else {
                 quant(h, N, T, xq);
+                mark("quantize");
                 ffn(L, l, T);
             }
+            mark(L.dense ? "ffn_dense" : "ffn_moe_total");
             if (pf && finite_check) {   // STRATA_FLINT_CHECK_FINITE=1: where do non-finite values first appear?
                 if (!d_cnt) CK(cudaMalloc(&d_cnt, 4));
                 const char* names[] = {"after the layer"};
@@ -2169,6 +2371,7 @@ struct Engine {
         k_rms<<<1, kThreads, 0, st>>>(x + (size_t) (T - 1) * N, M.out_norm, h, N, M.eps);
         quant(h, N, 1, xq);
         mm(M.head, xq, lg, 1);
+        mark("head");
         if (prof && T == 1) {
             CK(cudaStreamSynchronize(st));
             t_fwd += ms_since(tf0);
@@ -2414,9 +2617,10 @@ int strata::flint::run(int argc, char** argv) {
     int n_new = 16, ctx = 4096, bench = 0;
     double expert_vram = -1;
     bool trace = false, buffered = false, prof = false;
-    int chunk = 2048;
+    int chunk = 4096;
     double host_gib = -1;
     bool pin_host = true, prof_predict = false;
+    int bench_floor = 0;
     int prefetch_k = 0;   // the lookahead (--prefetch N): measured no faster than the page-locked host tier alone
     std::string nll_file;
     bool serve_mode = false;
@@ -2432,7 +2636,7 @@ int strata::flint::run(int argc, char** argv) {
         if (a == "--model" || a == "--native") path = next();
         else if (a == "--serve") serve_mode = true;
         else if (a == "--ctx") ctx = std::atoi(next());
-        else if (a == "--prefill") { const std::string v = next(); chunk = v == "auto" ? 2048 : std::atoi(v.c_str()); }
+        else if (a == "--prefill") { const std::string v = next(); chunk = v == "auto" ? 4096 : std::atoi(v.c_str()); }
         else if (a == "--gpu") (void) next();   // applied by strata before the switch (HIP_VISIBLE_DEVICES)
         else if (a == "--tokens") prompt = parse_ids(next());
         else if (a == "--n" || a == "--max-new") n_new = std::atoi(next());
@@ -2449,6 +2653,7 @@ int strata::flint::run(int argc, char** argv) {
         else if (a == "--no-pin-host") pin_host = false;
         else if (a == "--prefetch") prefetch_k = std::atoi(next());
         else if (a == "--prof-predict") prof_predict = true;
+        else if (a == "--bench-floor") bench_floor = std::atoi(next());
         else if (a == "--nll") nll_file = next();
         else if (a == "--dump-layers") dump_layers = next();
         else if (a == "--force") forced = parse_ids(next());
@@ -2457,7 +2662,7 @@ int strata::flint::run(int argc, char** argv) {
                         "  --n N                 tokens to generate (greedy), default 16\n"
                         "  --force IDS           teacher forcing: feed these ids instead of the greedy ones\n"
                         "  --max-context N       cells of the KV cache of the full-attention layers (default: prompt + new tokens)\n"
-                        "  --chunk N             prompt tokens per forward, 8..4096 (default 2048; 512 without the long-prompt path)\n"
+                        "  --chunk N             prompt tokens per forward, 8..4096 (default 4096; 512 without the long-prompt path; 2048 leaves ~7% more decode speed to the expert cache)\n"
                         "  --expert-vram GiB     VRAM for the expert cache (default: what is free after a warmup, less 0.6 GiB)\n"
                         "  --host-cache GiB      host RAM for the expert tier below it (default: MemAvailable less 3.5 GiB)\n"
                         "  --no-pin-host         do not page-lock the host tier (slower: its swaps are staged and synchronous)\n"
@@ -2555,6 +2760,42 @@ int strata::flint::run(int argc, char** argv) {
         Server sv(E, m);
         return sv.run();
     }
+    if (bench_floor > 0) {   // the time of a decode step with every expert a hit and no host work: eager, then as a graph
+        const int n = bench_floor;
+        E.fake_hit = true;
+        int32_t tk0 = 1000;
+        CK(cudaMemcpy(E.tok, &tk0, 4, cudaMemcpyHostToDevice));
+        E.skip_tok_copy = true;
+        for (int i = 0; i < 5; ++i) E.forward(&tk0, 1, 200, true);
+        CK(cudaStreamSynchronize(E.st));
+        auto t1 = Clock::now();
+        for (int i = 0; i < n; ++i) E.forward(&tk0, 1, 200, true);
+        CK(cudaStreamSynchronize(E.st));
+        const double eager = ms_since(t1) / n;
+        E.secprof = true;
+        for (int i = 0; i < 20; ++i) {
+            E.forward(&tk0, 1, 200, true);
+            E.marks_collect();
+        }
+        std::fprintf(stderr, "strata-flint: GPU time of a decode step by section (ms per step, from events; the sections nest as printed):\n");
+        for (const auto& kv : E.sec_ms) std::fprintf(stderr, "  %-30s %6.2f\n", kv.first.c_str(), kv.second / 20.0);
+        E.secprof = false;
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t gx = nullptr;
+        CK(cudaStreamBeginCapture(E.st, cudaStreamCaptureModeThreadLocal));
+        E.forward(&tk0, 1, 200, true);
+        CK(cudaStreamEndCapture(E.st, &graph));
+        CK(cudaGraphInstantiate(&gx, graph, 0));
+        for (int i = 0; i < 5; ++i) CK(cudaGraphLaunch(gx, E.st));
+        CK(cudaStreamSynchronize(E.st));
+        t1 = Clock::now();
+        for (int i = 0; i < n; ++i) CK(cudaGraphLaunch(gx, E.st));
+        CK(cudaStreamSynchronize(E.st));
+        const double graphed = ms_since(t1) / n;
+        std::fprintf(stderr, "strata-flint: floor of a decode step (every expert a hit, no host work): %.2f ms eager (%.1f tok/s), "
+                     "%.2f ms as a graph (%.1f tok/s)\n", eager, 1000.0 / eager, graphed, 1000.0 / graphed);
+        return 0;
+    }
     // the prompt, in chunks
     const auto t0 = Clock::now();
     const int np = (int) prompt.size();
@@ -2626,6 +2867,8 @@ int strata::flint::run(int argc, char** argv) {
         std::fprintf(stderr, "prof: %ld decode steps, %.1f ms each; per step streamed-layer waits: ids D2H+sync %.1f ms, "
                      "reads %.1f ms, upload+sync %.1f ms (%.1f streamed layers/step)\n", E.n_fwd, E.t_fwd / f, E.t_sync / f,
                      E.t_read / f, E.t_up / f, (double) E.n_calls / f);
+        std::fprintf(stderr, "prof: per decode step: %.2f ms reading the file (of the %.2f ms in load_experts), %.2f ms waiting for the GPU at the router's sync\n",
+                     E.t_ssdread / (double) E.n_fwd, E.t_read / (double) E.n_fwd, E.t_sync / (double) E.n_fwd);
         std::fprintf(stderr, "prof: VRAM misses: %ld from the host tier, %ld read from the SSD; %ld experts demoted to the host tier; %ld loaded ahead by the lookahead\n",
                      E.host_hits_, E.ssd_reads_, E.demoted_, E.pf_loaded_);
         if (E.pf_filled_v + E.pf_filled_h > 0)

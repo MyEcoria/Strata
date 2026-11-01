@@ -307,8 +307,8 @@ The engine keeps the experts that do not fit on the card in RAM, then reads them
 
 | Measure | Result |
 | --- | ---: |
-| Decode, after the cache is warm (about 600 tokens) | about 27 tokens/s |
-| Prompt, 6379 tokens of code | 94 tokens/s |
+| Prompt, 6,281 tokens of code, through the server | 1,153 tokens/s |
+| Decode, through the server | 24 to 31 tokens/s |
 
 How the experts are stored, how it was checked against llama.cpp, and what is not done: [FLINT.md](FLINT.md).
 
