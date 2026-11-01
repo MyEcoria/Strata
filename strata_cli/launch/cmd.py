@@ -811,7 +811,7 @@ def run_launch(a: argparse.Namespace) -> int:
                     _say(f"  model     {m.get('title') or 'your model files'}{size}   (your files in {s.model_path})")
                 else:
                     _say(f"  model     {m.get('title') or f'{s.family} {s.model}'}{size}")
-                _say(f"  context   {S.context_label(s.context)}    pictures {PICTURE_WORDS.get(s.vision or 'off', s.vision)}    parallel {('one at a time' if plan.get('placement') else s.parallel or 'fit to your card')}")
+                _say(f"  context   {S.context_label(s.context)}    pictures {PICTURE_WORDS.get(s.vision or 'off', s.vision)}    parallel {('one at a time' if plan.get('placement') or s.family == 'flint' else s.parallel or 'fit to your card')}")
                 _say(f"  download  {(plan.get('download') or {}).get('text', '')}")
                 if plan.get("drafting"):
                     _say(f"  drafting  {plan['drafting'].replace('Drafting: ', '', 1)}")

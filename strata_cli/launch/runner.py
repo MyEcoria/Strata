@@ -2123,6 +2123,8 @@ class Runner:
     def drafting_plan_line(self) -> str:
         """The drafting line of --plan: what drafts, or why not what was asked for. Nothing is changed or downloaded."""
         from strata_control import drafting
+        if self.s.family == "flint":                         # no draft layer, no drafter: Flint decodes one token at a time
+            return "Drafting: off (Flint has no draft layer)"
         if self.multi_file():                                # DeepSeek drafts with its own DSpark drafter (the --dspark auto the config writes), not MTP
             if sys.platform == "darwin":
                 return "Drafting: off (DeepSeek's drafter was not faster on a Mac)"
