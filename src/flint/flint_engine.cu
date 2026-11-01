@@ -114,6 +114,8 @@ __device__ float block_max(float v, float* sh) {
     return r;
 }
 
+#include "flint_kv.cuh"   // the optional quantised KV cache (--kv-quant tqt | hq)
+
 /// y[r] = rms(x[r]) * w, one block per row of n.
 __global__ void k_rms(const float* x, const float* w, float* y, int n, float eps) {
     __shared__ float sh[kThreads];
@@ -231,7 +233,8 @@ unsigned grid1(int64_t n, int b = kThreads) { return (unsigned) ((n + b - 1) / b
 /// `rope`, Q out as f32, K and V into the FP16 cache [HKV][ncell][128] (cell = position % ring when ring > 0, else the
 /// position).  Grid (H + HKV, T), 128 threads.
 __global__ void k_prep(const float* qx, const float* kx, const float* vx, const float* qw, const float* kw, float* qout,
-                       __half* kc, __half* vc, int H, int HKV, int p0, int rope, float base, float eps, int ring, int ncell) {
+                       __half* kc, __half* vc, int H, int HKV, int p0, int rope, float base, float eps, int ring, int ncell,
+                       __half* kst = nullptr, __half* vst = nullptr) {
     __shared__ float sh[kHD];
     __shared__ float row[kHD];
     const int t = blockIdx.y, hb = blockIdx.x, tid = threadIdx.x;
@@ -254,6 +257,12 @@ __global__ void k_prep(const float* qx, const float* kx, const float* vx, const 
         qout[((size_t) t * H + hb) * kHD + tid] = v;
     } else {
         const int kvh = hb - H;
+        if (kst) {   // a quantised layer: K and V wait in the staging for the encoder
+            const size_t o = ((size_t) t * HKV + kvh) * kHD + tid;
+            kst[o] = __float2half(v);
+            vst[o] = __float2half(vx[o]);
+            return;
+        }
         const int cell = ring > 0 ? pos % ring : pos;
         const size_t o = ((size_t) kvh * ncell + cell) * kHD + tid;
         kc[o] = __float2half(v);
@@ -929,6 +938,22 @@ struct Engine {
     // KV caches, per layer
     std::vector<__half*> kc, vc;
     std::vector<int> ncell;
+    // the quantised KV cache of the full-attention layers (--kv-quant): kv_mode 0 = FP16 (the default), 1 = trellis, 2 = HyperQuant
+    int kv_mode = 0, kv_bits = 3;
+    bool kv_check = false;   // STRATA_FLINT_KV_CHECK=1: the error of the codec against the vectors it was given, printed at the end
+    void kv_report() {
+        if (!kv_check) return;
+        double h[4] = {0, 0, 0, 0};
+        CK(cudaStreamSynchronize(st));
+        CK(cudaMemcpyFromSymbol(h, g_kv_chk, sizeof(h)));
+        auto db = [](double a, double e) { return a > 0 && e > 0 ? 10.0 * std::log10(a / e) : 0.0; };
+        std::fprintf(stderr, "strata-flint: KV codec error (long-prompt path): K %.2f dB, V %.2f dB (signal / error)\n", db(h[0], h[1]), db(h[2], h[3]));
+    }
+    std::vector<uint8_t*> kq_code, vq_code, kq_mt, vq_mt;
+    std::vector<__half*> kq_sc, vq_sc;
+    __half *kv_kst = nullptr, *kv_vst = nullptr, *kv_k16 = nullptr, *kv_v16 = nullptr;   // staging, and the FP16 copy a long prompt reads
+    static constexpr int kKvStageT = 512;
+    bool kvq(size_t li) const { return kv_mode != 0 && kq_code[li] != nullptr; }
     // streaming
     // ---- the prompt path for long chunks (T > kPf2Min): GEMMs on the matrix cores, the experts through llama.cpp's MMQ, a
     // loader thread that has the next groups of experts waiting in a ring of buffers while the GPU computes
@@ -1093,20 +1118,67 @@ struct Engine {
         pl = dal((size_t) max_chunks * kQB * m->H);
         // KV caches
         size_t kv_bytes = 0;
+        if (kv_mode && (m->H % m->HKV != 0 || m->H / m->HKV != kKvG)) {
+            std::fprintf(stderr, "strata-flint: --kv-quant needs %d query heads per KV head (this model has %lld / %lld)\n", kKvG,
+                         (long long) m->H, (long long) m->HKV);
+            std::exit(2);
+        }
         for (const Layer& L : m->layers) {
             const int nc = L.swa ? kRing : ctx;
             ncell.push_back(nc);
             const size_t n = (size_t) m->HKV * nc * kHD;
             __half *k_ = nullptr, *v_ = nullptr;
-            CK(cudaMalloc(&k_, n * 2));
-            CK(cudaMalloc(&v_, n * 2));
-            CK(cudaMemset(k_, 0, n * 2));
-            CK(cudaMemset(v_, 0, n * 2));
+            uint8_t *kcq = nullptr, *vcq = nullptr, *kmt = nullptr, *vmt = nullptr;
+            __half *ksc = nullptr, *vsc = nullptr;
+            if (kv_mode && !L.swa) {
+                const size_t nvec = (size_t) m->HKV * nc, pbytes = nvec * 16 * kv_bits + 64;
+                CK(cudaMalloc(&kcq, pbytes));
+                CK(cudaMalloc(&vcq, pbytes));
+                CK(cudaMemset(kcq, 0, pbytes));
+                CK(cudaMemset(vcq, 0, pbytes));
+                CK(cudaMalloc(&ksc, nvec * 2));
+                CK(cudaMalloc(&vsc, nvec * 2));
+                CK(cudaMemset(ksc, 0, nvec * 2));
+                CK(cudaMemset(vsc, 0, nvec * 2));
+                kv_bytes += 2 * (pbytes + nvec * 2);
+                if (kv_mode == 2) {
+                    CK(cudaMalloc(&kmt, nvec));
+                    CK(cudaMalloc(&vmt, nvec));
+                    CK(cudaMemset(kmt, 0, nvec));
+                    CK(cudaMemset(vmt, 0, nvec));
+                    kv_bytes += 2 * nvec;
+                }
+            } else {
+                CK(cudaMalloc(&k_, n * 2));
+                CK(cudaMalloc(&v_, n * 2));
+                CK(cudaMemset(k_, 0, n * 2));
+                CK(cudaMemset(v_, 0, n * 2));
+                kv_bytes += 2 * n * 2;
+            }
             kc.push_back(k_);
             vc.push_back(v_);
-            kv_bytes += 2 * n * 2;
+            kq_code.push_back(kcq);
+            vq_code.push_back(vcq);
+            kq_mt.push_back(kmt);
+            vq_mt.push_back(vmt);
+            kq_sc.push_back(ksc);
+            vq_sc.push_back(vsc);
         }
-        std::fprintf(stderr, "strata-flint: context %d cells, KV cache %.2f GiB (FP16)\n", ctx, (double) kv_bytes / (1 << 30));
+        size_t scratch = 0;
+        if (kv_mode) {   // the encoder's staging, and the FP16 copy of one layer's keys that a long prompt reads
+            const size_t stg = (size_t) kKvStageT * m->HKV * kHD * 2, cp = (size_t) m->HKV * ctx * kHD * 2;
+            CK(cudaMalloc(&kv_kst, stg));
+            CK(cudaMalloc(&kv_vst, stg));
+            CK(cudaMalloc(&kv_k16, cp));
+            CK(cudaMalloc(&kv_v16, cp));
+            scratch = 2 * stg + 2 * cp;
+        }
+        if (kv_mode)
+            std::fprintf(stderr, "strata-flint: context %d cells, KV cache %.2f GiB (%s, %d bits per sample, in the full layers; the sliding-window layers stay FP16) + %.2f GiB scratch\n",
+                         ctx, (double) kv_bytes / (1 << 30), kv_mode == 1 ? "TurboQuant Trellis" : "HyperQuant", kv_bits,
+                         (double) scratch / (1 << 30));
+        else
+            std::fprintf(stderr, "strata-flint: context %d cells, KV cache %.2f GiB (FP16)\n", ctx, (double) kv_bytes / (1 << 30));
     }
 
     /// Staging for the streamed layers (the largest expert blob x the most entries one forward can have), the direct
@@ -2395,6 +2467,62 @@ struct Engine {
         gemm.native((const uint16_t*) x16, w.type, w.d, out, T, w.n_out, w.n_in);
     }
 
+#define KV_DISPATCH(CALL)                       \
+    if (kv_mode == 1) {                         \
+        constexpr int MODE = 1;                 \
+        if (kv_bits == 2) {                     \
+            constexpr int KB = 2;               \
+            CALL;                               \
+        } else if (kv_bits == 3) {              \
+            constexpr int KB = 3;               \
+            CALL;                               \
+        } else {                                \
+            constexpr int KB = 4;               \
+            CALL;                               \
+        }                                       \
+    } else {                                    \
+        constexpr int MODE = 2, KB = 4;         \
+        CALL;                                   \
+    }
+
+    /// The K and V that k_prep left in the staging (T tokens at p0 ..) of a quantised layer, encoded into its cache.
+    void kv_encode(size_t li, int T, int p0) {
+        const Model& M = *m;
+        if (T > kKvStageT) {
+            std::fprintf(stderr, "strata-flint: %d tokens in one attention call exceed the %d of the KV staging\n", T, kKvStageT);
+            std::exit(1);
+        }
+        const dim3 g((unsigned) M.HKV, (unsigned) T, 2);
+        if (kv_mode == 1) {
+            if (kv_bits == 2)
+                k_kvq_enc_tqt<2><<<g, 256, 0, st>>>(kv_kst, kv_vst, kq_code[li], vq_code[li], kq_sc[li], vq_sc[li], (int) M.HKV, (int) li, p0, ncell[li]);
+            else if (kv_bits == 3)
+                k_kvq_enc_tqt<3><<<g, 256, 0, st>>>(kv_kst, kv_vst, kq_code[li], vq_code[li], kq_sc[li], vq_sc[li], (int) M.HKV, (int) li, p0, ncell[li]);
+            else
+                k_kvq_enc_tqt<4><<<g, 256, 0, st>>>(kv_kst, kv_vst, kq_code[li], vq_code[li], kq_sc[li], vq_sc[li], (int) M.HKV, (int) li, p0, ncell[li]);
+        } else {
+            k_kvq_enc_hq<<<g, 128, 0, st>>>(kv_kst, kv_vst, kq_code[li], vq_code[li], kq_sc[li], vq_sc[li], kq_mt[li], vq_mt[li], (int) M.HKV,
+                                            (int) li, p0, ncell[li], kv_bits);
+        }
+    }
+
+    /// The FP16 copy (kv_k16 / kv_v16, the cache's own layout) of keys [k0, k0 + n) of a quantised layer.
+    void kv_dequant(size_t li, int k0, int n) {
+        if (n <= 0) return;
+        const dim3 g((unsigned) ((n + 3) / 4), (unsigned) m->HKV, 2);
+        KV_DISPATCH((k_kvq_dequant<MODE, KB><<<g, 128, 0, st>>>(kq_code[li], kq_sc[li], kq_mt[li], vq_code[li], vq_sc[li], vq_mt[li], kv_k16,
+                                                                 kv_v16, ncell[li], k0, n, (int) li, kv_bits)));
+    }
+
+    /// Attention part 1 of a quantised layer: the partials k_att_merge takes (the 8 query heads of a KV head in one block).
+    void kv_att_part(size_t li, const float* qp, int nt, int pb, int nchunk) {
+        const Model& M = *m;
+        const dim3 g((unsigned) nchunk, (unsigned) (nt * M.HKV));
+        KV_DISPATCH((k_att_part_q<MODE, KB><<<g, 128, 0, st>>>(qp, kq_code[li], kq_sc[li], kq_mt[li], vq_code[li], vq_sc[li], vq_mt[li], (int) M.H,
+                                                                (int) M.HKV, pb, ncell[li], 1.0f / sqrtf((float) kHD), pacc, pm, pl, nchunk,
+                                                                (int) li, kv_bits)));
+    }
+
     /// The attention block of layer li for a long chunk: the projections on the matrix cores, then blocks of 256 queries: Q / K
     /// norm and rotary embedding, the cache written, scores = K^T Q by batched GEMM per KV head, the softmax with the sink,
     /// output = V P.  A sliding-window layer reads its window out of the ring into a compact buffer.
@@ -2408,12 +2536,19 @@ struct Engine {
         gm(L.wv, vb, T);
         const int ring = L.swa ? kRing : 0, window = L.swa ? (int) M.window : 0;
         const float scale = 1.0f / sqrtf((float) kHD);
+        const bool qz = kvq(li);
+        if (qz) kv_dequant(li, 0, p0);   // (the keys of the chunks before: this chunk's are added as they are encoded)
         for (int t0 = 0; t0 < T; t0 += 256) {
             const int nt = std::min(256, T - t0), pb = p0 + t0;
             k_prep<<<dim3(H + HKV, nt), kHD, 0, st>>>(qb + (size_t) t0 * H * kHD, kb + (size_t) t0 * HKV * kHD,
                                                       vb + (size_t) t0 * HKV * kHD, L.q_norm, L.k_norm,
                                                       qr + (size_t) t0 * H * kHD, kc[li], vc[li], H, HKV, pb, L.rope ? 1 : 0,
-                                                      M.rope_base, M.eps, ring, ncell[li]);
+                                                      M.rope_base, M.eps, ring, ncell[li], qz ? kv_kst : nullptr, qz ? kv_vst : nullptr);
+            if (qz) {
+                kv_encode(li, nt, pb);
+                kv_dequant(li, pb, nt);
+                if (kv_check) k_kv_err<<<dim3((unsigned) HKV, (unsigned) nt, 2), kHD, 0, st>>>(kv_kst, kv_vst, kv_k16, kv_v16, HKV, ncell[li], pb);
+            }
             k_to_f16<<<grid1((int64_t) nt * H * kHD), kThreads, 0, st>>>(qr + (size_t) t0 * H * kHD, q16, (int64_t) nt * H * kHD);
             const int khi = pb + nt - 1, klo = window > 0 ? std::max(0, pb - window + 1) : 0, nk = khi - klo + 1;
             const __half *Kb, *Vb;
@@ -2425,8 +2560,8 @@ struct Engine {
                 Vb = v16w;
                 kvs = (size_t) nk * kHD;
             } else {
-                Kb = kc[li];
-                Vb = vc[li];
+                Kb = qz ? kv_k16 : kc[li];
+                Vb = qz ? kv_v16 : vc[li];
                 kvs = (size_t) ncell[li] * kHD;
             }
             const int ldp = (nk + 7) / 8 * 8;
@@ -2587,16 +2722,21 @@ struct Engine {
         mm(L.wk, xq, kb, T);
         mm(L.wv, xq, vb, T);
         const int ring = L.swa ? kRing : 0;
+        const bool qz = kvq(li);
         k_prep<<<dim3(H + HKV, T), kHD, 0, st>>>(qb, kb, vb, L.q_norm, L.k_norm, qr, kc[li], vc[li], H, HKV, p0, L.rope ? 1 : 0,
-                                                 M.rope_base, M.eps, ring, ncell[li]);
+                                                 M.rope_base, M.eps, ring, ncell[li], qz ? kv_kst : nullptr, qz ? kv_vst : nullptr);
+        if (qz) kv_encode(li, T, p0);
         const int window = L.swa ? (int) M.window : 0;
         for (int t0 = 0; t0 < T; t0 += kQB) {   // query blocks: the partials are sized for kQB queries
             const int nt = std::min(kQB, T - t0);
             const int pb = p0 + t0, last = pb + nt - 1;
             const int n_max = window > 0 ? std::min(last + 1, window) : last + 1;
             const int nchunk = (n_max + kAttChunk - 1) / kAttChunk;
-            k_att_part<<<dim3(nchunk, nt * H), kHD, 0, st>>>(qr + (size_t) t0 * H * kHD, kc[li], vc[li], H, HKV, pb, window,
-                                                             ring, ncell[li], 1.0f / sqrtf((float) kHD), pacc, pm, pl, nchunk);
+            if (qz)
+                kv_att_part(li, qr + (size_t) t0 * H * kHD, nt, pb, nchunk);
+            else
+                k_att_part<<<dim3(nchunk, nt * H), kHD, 0, st>>>(qr + (size_t) t0 * H * kHD, kc[li], vc[li], H, HKV, pb, window,
+                                                                 ring, ncell[li], 1.0f / sqrtf((float) kHD), pacc, pm, pl, nchunk);
             k_att_merge<<<nt * H, kHD, 0, st>>>(pacc, pm, pl, L.sinks, H, nchunk, att + (size_t) t0 * H * kHD);
         }
         quant(att, H * kHD, T, q8);
@@ -2963,7 +3103,7 @@ struct Server {
 int strata::flint::run(int argc, char** argv) {
     std::string path, dump, dump_layers;
     std::vector<int32_t> prompt, forced;
-    int n_new = 16, ctx = 4096, bench = 0;
+    int n_new = 16, ctx = 4096, bench = 0, kv_mode = 0, kv_bits = 3;
     double expert_vram = -1;
     bool trace = false, buffered = false, prof = false;
     int chunk = 2048;
@@ -2993,6 +3133,22 @@ int strata::flint::run(int argc, char** argv) {
         else if (a == "--max-context") ctx = std::atoi(next());
         else if (a == "--expert-vram") expert_vram = std::atof(next());
         else if (a == "--bench-tg") bench = std::atoi(next());
+        else if (a == "--kv-quant") {
+            const std::string v = next();
+            if (v == "none" || v == "fp16") kv_mode = 0;
+            else if (v == "tqt" || v == "turboquant-trellis") kv_mode = 1;
+            else if (v == "hq" || v == "hyperquant") kv_mode = 2;
+            else {
+                std::fprintf(stderr, "strata-flint: --kv-quant takes none, tqt or hq (not %s)\n", v.c_str());
+                return 2;
+            }
+        } else if (a == "--kv-bits") {
+            kv_bits = std::atoi(next());
+            if (kv_bits < 2 || kv_bits > 4) {
+                std::fprintf(stderr, "strata-flint: --kv-bits takes 2, 3 or 4\n");
+                return 2;
+            }
+        }
         else if (a == "--trace") trace = true;
         else if (a == "--buffered") buffered = true;
         else if (a == "--prof") prof = true;
@@ -3011,6 +3167,8 @@ int strata::flint::run(int argc, char** argv) {
                         "  --n N                 tokens to generate (greedy), default 16\n"
                         "  --force IDS           teacher forcing: feed these ids instead of the greedy ones\n"
                         "  --max-context N       cells of the KV cache of the full-attention layers (default: prompt + new tokens)\n"
+                        "  --kv-quant MODE       the KV cache of the full-attention layers: none (FP16, default), tqt (TurboQuant Trellis) or hq (HyperQuant)\n"
+                        "  --kv-bits N           bits per sample of --kv-quant, 2, 3 (default) or 4: 3 bits is about 5x less cache than FP16\n"
                         "  --chunk N             prompt tokens per forward, 8..4096 (default 2048; 512 without the long-prompt path; every 1000 tokens of chunk takes ~0.3 GiB from the expert cache in VRAM)\n"
                         "  --expert-vram GiB     VRAM for the expert cache (default: what is free after a warmup, less 0.6 GiB)\n"
                         "  --host-cache GiB      host RAM for the expert tier below it (default: MemAvailable less 2.5 GiB, at most 70% of the RAM)\n"
@@ -3075,6 +3233,9 @@ int strata::flint::run(int argc, char** argv) {
         layer_dump.assign((prompt.size() + steps) * (size_t) m.L * (size_t) m.N, 0.f);
         E.dump = &layer_dump;
     }
+    E.kv_mode = kv_mode;
+    E.kv_bits = kv_bits;
+    if (const char* kc_ = std::getenv("STRATA_FLINT_KV_CHECK")) E.kv_check = kc_[0] == '1';
     E.init(m, ctx);
     E.init_staging();
     E.pf_init();
@@ -3251,6 +3412,7 @@ int strata::flint::run(int argc, char** argv) {
         }
         if (fdump) std::fwrite(lg.data(), 4, lg.size(), fdump);
     }
+    E.kv_report();
     print_prof();
     if (prof_predict && E.pr_total > 0)
         std::fprintf(stderr, "predict: next layer's experts guessed from this layer's residual: of the experts really chosen, %.0f%% are in the guess's top 6, %.0f%% in its top 12, %.0f%% in its top 16; of the VRAM misses, %.0f%% in the top 12 and %.0f%% in the top 16 (%ld misses)\n",

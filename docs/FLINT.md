@@ -115,7 +115,7 @@ With every expert in memory, a prompt of up to a thousand tokens takes about a s
 
 ## Context, KV cache, several clients
 
-**KV cache.** FP16 only (no quantized KV in this engine). It costs about 28 KB per token (measured: 0.94 GiB at 32,768 cells and 7.07 GiB
+**KV cache.** FP16 by default (an optional quantized cache is described [below](#quantized-kv-cache-optional)). It costs about 28 KB per token (measured: 0.94 GiB at 32,768 cells and 7.07 GiB
 at 262,144) plus 0.07 GiB for the rings of the sliding-window layers. The model documents 262,144 tokens as its context. The setup's
 choice for a 16 GB card is **32,768**. The engine starts at every size up to 262,144 on this card, but the KV cache comes out of the
 VRAM that holds experts, so the decode slows down as the context grows (same 8 sampled questions as above, one at a time):
@@ -162,6 +162,83 @@ More agents do not give more tokens per second, they wait in line. Agents with d
 conversation again at every switch (a conversation is only continued if it is the one the engine holds); agents that start with the
 same system prompt only re-read what differs, and the aggregate speed stays near the single-client one. The remedy is a second slot
 (`--parallel`), which Flint does not have.
+
+## Quantized KV cache (optional)
+
+Two optional codecs shrink the KV cache of the full-attention layers (the sliding-window layers keep their small FP16 ring). They are
+off by default: without the option the engine is the one measured above. **Make no claim from this section about the original
+(BF16) model: nothing here was compared with it.**
+
+```sh
+strata-flint --model flint-UD-Q4_K_XL.gguf ... --kv-quant tqt --kv-bits 3      # TurboQuant Trellis
+strata-flint --model flint-UD-Q4_K_XL.gguf ... --kv-quant hq  --kv-bits 3      # HyperQuant
+```
+
+In a server config put the same two options in `"args"` next to `--max-context`. `--kv-bits` is 2, 3 (default) or 4.
+
+| Codec | What it does | Where it comes from |
+| --- | --- | --- |
+| `tqt` TurboQuant Trellis | Each K or V vector of 128 is rotated (random signs, then a Hadamard transform), its RMS is kept apart, and the samples are coded by a trellis-coded quantizer: a bit-shift trellis of 256 states, k bits per sample, a trained table of 256 values and a Viterbi search | TurboQuant's pipeline (rotation, norm, one fixed codebook, no calibration) **without** its QJL stage, with a trellis in place of its scalar quantizer. The community fork [llama-tq](https://github.com/LL4nc33/llama-tq/blob/turboquant/docs/turboquant.md) has trellis KV types for llama.cpp (a shift-register trellis, a Viterbi search, 12 or 16 state bits, a Gaussian table; for keys it also keeps the 4 largest values of each block of 128 in FP16). This is an independent implementation, written from that description (the fork's code was not read or run), and it differs: 256 states with a table trained on Gaussian numbers, and no FP16 outliers. Tables: `tools/flint/kv_codebooks.py` |
+| `hq` HyperQuant | The same rotation, then 8 samples at a time snapped to the nearest point of the E8 lattice, the lattice coordinates Rice-coded, and per vector the finest of 32 step sizes whose code fits `128 x bits` bits | The design of [arXiv 2606.23406](https://arxiv.org/abs/2606.23406) (rotation, E8, Rice code), **without** its dither or QJL bias correction and without its fused matrix-core kernels. The fixed budget per vector is ours, so a vector can still be found by its index |
+
+A vector costs 16 x bits bytes plus its RMS (2 bytes; `hq` adds one byte): 51 bytes at 3 bits, against 256 in FP16.
+
+**How well the codecs store the vectors** (the real keys and values of a 4,096-token text, the error of the decoded vector against the
+vector it was given; the simulation on Gaussian numbers gave the same values to 0.2 dB):
+
+| Bits | `tqt` | `hq` | One scalar quantizer (simulated) |
+| ---: | ---: | ---: | ---: |
+| 2 | 10.9 dB | 9.2 dB | 9.3 dB |
+| 3 | 16.5 dB | 15.9 dB | 14.6 dB |
+| 4 | 22.1 dB | 22.1 dB | 20.2 dB |
+
+**What it does to the model.** Same 16,383 tokens of this repository's documents (one text; positions are not independent, so the
+`+-` is only a rough guide), mean loss per token (natural log, FP16 cache: 2.8457), and, after a 4,096-token prompt, 41 steps compared
+with the FP16 cache (KL of the next-token distribution, and how often the best token is the same):
+
+| Setting | Mean loss, change | Mean change of one token's loss | KL, mean of 41 | Same best token |
+| --- | ---: | ---: | ---: | ---: |
+| `tqt` 2 bits | +0.024 +- 0.013 | 0.77 | 0.505 | 32 / 41 |
+| `tqt` 3 bits | -0.004 +- 0.009 | 0.46 | 0.134 | 32 / 41 |
+| `tqt` 4 bits | -0.008 +- 0.008 | 0.34 | 0.103 | 35 / 41 |
+| `hq` 3 bits | -0.038 +- 0.008 | 0.46 | 0.178 | 30 / 41 |
+| `hq` 4 bits | +0.001 +- 0.007 | 0.33 | 0.086 | 37 / 41 |
+
+The mean loss stays within about 1% of FP16 at 3 and 4 bits (2 bits is worse), but this is **not lossless**: single predictions
+change (a change of 0.3 to 0.5 in a token's loss on average, a best token that differs in 4 to 11 of 41 steps). The model is a
+mixture of experts, where a small change can send a token to another expert. That `hq` at 3 bits has a *lower* loss than FP16 is not
+a sign that it is better and is not explained. Needle in a haystack through the server (6-digit code at 10%, 50% and 90%, at 5,128,
+16,127 and 29,812 tokens): found 9 times out of 9 with either codec, as with FP16.
+
+**Speed.** Decode, the 8 sampled questions of above, one at a time, `tqt` at 3 bits (the FP16 column is the table above; at 32,768 it
+was measured again: 56.6):
+
+| `--max-context` | FP16 cache | `tqt` 3 bits | KV cache (+ scratch) | Experts in VRAM |
+| --- | ---: | ---: | ---: | ---: |
+| 16,384 | 63.7 tokens/s | 62.6 | 0.15 GiB (+ 0.03) | 11.6 GiB |
+| **32,768 (setup default)** | 57.2 | **62.2** | 0.24 GiB (+ 0.06) | 11.4 GiB |
+| 65,536 | 45.0 | 57.7 | 0.41 GiB (+ 0.13) | 11.2 GiB |
+| 131,072 | 30.6 | 50.4 | 0.75 GiB (+ 0.25) | 10.5 GiB |
+| 262,144 | 17.2 | 37.8 | 1.44 GiB (+ 0.50) | 9.3 GiB |
+
+At 32,768, other settings: `tqt` 2 bits 62.5, 4 bits 61.1; `hq` 3 bits 60.8. `hq` at 262,144: 37.5. With `tqt` the setup's default context
+reaches 60 tokens/s on this machine.
+
+The gain is the VRAM: the smaller cache leaves room for more experts. It is **not** a faster attention. The scratch is one layer's
+keys and values in FP16, which a long prompt needs. When the context is *filled*, the decode is slower than FP16, because decoding
+the codes costs more than reading FP16: after a 27,018-token prompt, 40 to 44 tokens/s with `tqt` and 35 to 37 with `hq`, against 48
+for FP16; the prompt itself is read at 665 and 674 tokens/s against 698. In the unit test (`tools/flint/kv_test.sh 32768`, one token,
+32 query heads, one layer) the attention kernel takes 0.44 ms with `tqt` at 3 bits and 0.86 ms with `hq`, against 0.40 ms for the
+FP16 kernel. So these options pay when the context you allocate is much bigger than the context you fill; if you fill it, keep FP16.
+
+`tools/flint/kv_test.sh` checks the codecs and the attention kernel on their own (no model): the attention over the codes against a
+double-precision attention over the same decoded vectors, all six settings pass. `STRATA_FLINT_KV_CHECK=1` prints the codec error on
+the real vectors of a prompt.
+
+The fork's document says keys need the FP16 outliers because real keys are far from Gaussian after the rotation. Here the error of `tqt` on the real keys was the Gaussian one (16.5 dB at 3 bits against 16.4 simulated), so nothing pointed to outliers; a variant with them was not tried, and the fork's own measurements are on other models (Qwen3), not on Flint.
+
+Not done: a quantized cache for the sliding-window layers (they are 0.07 GiB), a faster `hq` kernel, running a model other than this
+one, comparison with the original-precision model.
 
 ## Accuracy
 
